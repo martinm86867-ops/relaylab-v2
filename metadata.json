@@ -1,0 +1,6 @@
+{
+  "name": "RelayLab — Multi-Agent 2D Platformer Engine",
+  "description": "Real-time collaborative 2D puzzle platformer engine with centralized WebSocket/REST physics synchronization, autonomous agent decision telemetry, and human play.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
