@@ -12,10 +12,12 @@ import {
 } from './physics';
 import {
   buildNavigationGraph,
+  buildShortestPathTree,
   buildWalkSegments,
   createAgentMemory,
   decideAgentAction,
   findPathToPoint,
+  resolvePathFromTree,
 } from './agentPlanner';
 import type { ActorInput } from './types';
 
@@ -62,6 +64,7 @@ test('autonomous agents coordinate and fully solve Level 2 Crate Counterweight w
   assert.equal(world.channels.B, true, 'Lift Lever B should be activated');
   assert.equal(world.channels.A, true, 'Crate 1 should weight Plate A open');
   assert.equal(world.solved, true, 'Two autonomous agents should solve Level 2 completely');
+  assert.equal(world.metrics.respawns, 0, 'Agents must not walk or jump into the plasma strip');
 });
 
 test('autonomous agents ride shaft lift and collaborate to solve Level 3 Lift & Boost', () => {
@@ -376,3 +379,84 @@ test('built-in agent honors external drop-in agent claim & request messages in o
 });
 
 
+
+
+test('sandbox navigation reaches Switch B and Plate A via updraft edges', () => {
+  const level = getLevelById('sandbox');
+  const world = createWorld(level, [{ id: 'agent-1', name: 'Scout', role: 'agent' }]);
+  const obs = buildAgentObservation(world, 'agent-1')!;
+  const graph = buildNavigationGraph(obs);
+  const tree = buildShortestPathTree(graph, { x: obs.self.x + 13, y: obs.self.y + 34 });
+  const switchB = obs.switches.find((s) => s.label === 'Switch B')!;
+  const switchPath = resolvePathFromTree(obs, tree, {
+    x: switchB.x + switchB.w * 0.5,
+    y: switchB.y + switchB.h,
+  });
+  assert.equal(switchPath.reachable, true, 'Switch B should be reachable through the sandbox updraft route');
+  const plateA = obs.plates.find((p) => p.label === 'Plate A')!;
+  const platePath = resolvePathFromTree(obs, tree, {
+    x: plateA.x + plateA.w * 0.5,
+    y: plateA.y + plateA.h,
+  });
+  assert.equal(platePath.reachable, true, 'Plate A should be reachable on the sandbox floor');
+});
+
+
+test('autonomous agents solve Physics Sandbox using the updraft and stacked crate route', () => {
+  const level = getLevelById('sandbox');
+  const world = createWorld(level, [
+    { id: 'agent-1', name: 'Sandbox-A', role: 'agent' },
+    { id: 'agent-2', name: 'Sandbox-B', role: 'agent' },
+  ]);
+  const mem1 = createAgentMemory();
+  const mem2 = createAgentMemory();
+
+  for (let tick = 0; tick < 2200 && !world.solved; tick++) {
+    const obs1 = buildAgentObservation(world, 'agent-1')!;
+    const obs2 = buildAgentObservation(world, 'agent-2')!;
+    stepWorld(
+      world,
+      level,
+      {
+        'agent-1': decideAgentAction(obs1, mem1),
+        'agent-2': decideAgentAction(obs2, mem2),
+      },
+      FIXED_DT
+    );
+  }
+
+  assert.equal(world.solved, true, 'Two autonomous agents should solve the sandbox');
+  assert.equal(world.channels.A, true);
+  assert.equal(world.channels.B, true);
+});
+
+
+test('autonomous agents solve Level 5 Cascade Foundry', () => {
+  const level = getLevelById('level-5');
+  const world = createWorld(level, [
+    { id: 'agent-1', name: 'Foundry-A', role: 'agent' },
+    { id: 'agent-2', name: 'Foundry-B', role: 'agent' },
+  ]);
+  const mem1 = createAgentMemory();
+  const mem2 = createAgentMemory();
+
+  for (let tick = 0; tick < 1500 && !world.solved; tick++) {
+    const obs1 = buildAgentObservation(world, 'agent-1')!;
+    const obs2 = buildAgentObservation(world, 'agent-2')!;
+    stepWorld(
+      world,
+      level,
+      {
+        'agent-1': decideAgentAction(obs1, mem1),
+        'agent-2': decideAgentAction(obs2, mem2),
+      },
+      FIXED_DT
+    );
+  }
+
+  assert.equal(world.solved, true, 'Two autonomous agents should solve Cascade Foundry');
+  assert.equal(world.channels.A, true);
+  assert.equal(world.channels.B, true);
+  assert.equal(world.channels.C, true);
+  assert.equal(world.metrics.respawns, 0, 'Agents must not jump into the foundry plasma');
+});

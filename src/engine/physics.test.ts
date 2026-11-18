@@ -77,6 +77,83 @@ test('pushing crate onto plate activates channel and frees actor', () => {
   assert.equal(world.channels.A, true);
 });
 
+test('landing on a kinetic ball transfers momentum and rolls it', () => {
+  const level = getLevelById('sandbox');
+  const world = createWorld(level, [{ id: 'p1', name: 'Human', role: 'human' }]);
+  const ball = world.crates.find((c) => c.shape === 'ball')!;
+  const actor = world.actors[0];
+
+  ball.x = 300;
+  ball.y = 492 - ball.h;
+  ball.vx = 0;
+  ball.vy = 0;
+  ball.angle = 0;
+  ball.angularVel = 0;
+  actor.x = ball.x + ball.w / 2 - actor.w / 2;
+  actor.y = ball.y - 120;
+  actor.vx = 0;
+  actor.vy = 0;
+  actor.grounded = false;
+  const startX = ball.x;
+  let peakSpeed = 0;
+  let minActorVy = 0;
+
+  for (let i = 0; i < 90; i++) {
+    stepWorld(world, level, { p1: { move: 0, jump: false, interact: false, grab: false } }, FIXED_DT);
+    peakSpeed = Math.max(peakSpeed, Math.abs(ball.vx));
+    minActorVy = Math.min(minActorVy, actor.vy);
+  }
+
+  assert.ok(Math.abs(ball.x - startX) > 8, 'Ball should roll away from the landing point');
+  assert.ok(peakSpeed > 80, 'Landing should impart a meaningful horizontal impulse to the ball');
+  assert.ok(world.metrics.collisionCount >= 1, 'Landing should count as a collision');
+  assert.ok(minActorVy < -80, 'Rubber ball should bounce the actor back upward');
+});
+
+test('a rolling ball shoves an idle actor instead of passing through', () => {
+  const level = getLevelById('sandbox');
+  const world = createWorld(level, [{ id: 'p1', name: 'Human', role: 'human' }]);
+  const ball = world.crates.find((c) => c.shape === 'ball')!;
+  const actor = world.actors[0];
+
+  // Clear the floor for a clean ground-level collision test.
+  for (const p of world.platforms) {
+    if (!['floor-main', 'wall-left', 'wall-right', 'ceil-top'].includes(p.id)) {
+      p.x = 4000;
+      p.y = 2000;
+    }
+  }
+  for (const c of world.crates) {
+    if (c.id !== ball.id) {
+      c.x = 4000;
+      c.y = 2000;
+    }
+  }
+
+  ball.x = 300;
+  ball.y = 492 - ball.h;
+  ball.vx = 260;
+  ball.vy = 0;
+  ball.grounded = true;
+  actor.x = 360;
+  actor.y = 492 - actor.h;
+  actor.vx = 0;
+  actor.vy = 0;
+  actor.grounded = true;
+  const startActorX = actor.x;
+
+  for (let i = 0; i < 25; i++) {
+    stepWorld(world, level, { p1: { move: 0, jump: false, interact: false, grab: false } }, FIXED_DT);
+  }
+
+  assert.ok(actor.x > startActorX + 8, 'Rolling ball should shove the idle actor sideways');
+  assert.ok(ball.vx < 260, 'Shoving the actor should slow the ball');
+  assert.ok(
+    !(actor.x < ball.x + ball.w && actor.x + actor.w > ball.x && actor.y < ball.y + ball.h && actor.y + actor.h > ball.y),
+    'Actor and ball must not remain overlapped'
+  );
+});
+
 test('sandbox level loads with multiple materials, force zones, and kinetic ball', () => {
   const level = getLevelById('sandbox');
   const world = createWorld(level, [{ id: 'p1', name: 'Human', role: 'human' }]);
@@ -186,9 +263,57 @@ test('grab toggle picks up crate, gently drops when stationary, and throws when 
   // Pick up again and throw while running right
   stepWorld(world, level, { p1: { move: 0, jump: false, interact: false, grab: false } }, FIXED_DT);
   stepWorld(world, level, { p1: { move: 0, jump: false, interact: false, grab: true } }, FIXED_DT);
+  const reHeld = world.crates.find((c) => c.id === world.actors[0].holdingCrateId)!;
   stepWorld(world, level, { p1: { move: 1, jump: false, interact: false, grab: false } }, FIXED_DT);
   stepWorld(world, level, { p1: { move: 1, jump: false, interact: false, grab: true } }, FIXED_DT);
-  assert.ok(crate.vx > 120, 'Moving throw should impart strong forward velocity');
+  assert.ok(reHeld.vx > 120, 'Moving throw should impart strong forward velocity');
+});
+
+test('picked crate is centered above the actor and set down on the floor ahead', () => {
+  const level = getLevelById('sandbox');
+  const world = createWorld(level, [{ id: 'p1', name: 'Human', role: 'human' }]);
+  const crate = world.crates[0];
+  const actor = world.actors[0];
+  actor.x = crate.x - 10;
+  actor.y = 492 - actor.h;
+  actor.grounded = true;
+
+  stepWorld(world, level, { p1: { move: 0, jump: false, interact: false, grab: true } }, FIXED_DT);
+  assert.equal(actor.holdingCrateId, crate.id, 'Should pick up the nearby crate');
+  assert.ok(
+    Math.abs(crate.x + crate.w * 0.5 - (actor.x + actor.w * 0.5)) < 0.6,
+    'Carried crate must be horizontally centered on the actor'
+  );
+  assert.ok(
+    crate.y + crate.h <= actor.y - 5,
+    'Carried crate must sit above the actor crown with visible hand clearance'
+  );
+
+  // Second press with no movement sets it down.
+  stepWorld(world, level, { p1: { move: 0, jump: false, interact: false, grab: false } }, FIXED_DT);
+  stepWorld(world, level, { p1: { move: 0, jump: false, interact: false, grab: true } }, FIXED_DT);
+  assert.equal(actor.holdingCrateId, null, 'Second press releases the crate');
+  assert.ok(
+    Math.abs(crate.y + crate.h - (actor.y + actor.h)) < 0.6,
+    'Stationary release should set the crate on the floor'
+  );
+  assert.ok(crate.x > actor.x, 'Stationary release should set the crate down ahead of the actor');
+});
+
+test('grab reach rejects a crate too far above the actor', () => {
+  const level = getLevelById('sandbox');
+  const world = createWorld(level, [{ id: 'p1', name: 'Human', role: 'human' }]);
+  const crate = world.crates[0];
+  world.crates = [crate];
+  const actor = world.actors[0];
+  actor.x = crate.x;
+  actor.y = 458;
+  actor.grounded = true;
+  crate.x = actor.x;
+  crate.y = actor.y - 90;
+
+  stepWorld(world, level, { p1: { move: 0, jump: false, interact: false, grab: true } }, FIXED_DT);
+  assert.equal(actor.holdingCrateId, null, 'Crate 90 px above must be out of grab reach');
 });
 
 test('sandbox bounce pad, ice strip, updraft wind zone, and perimeter blast containment work reliably', () => {
@@ -594,11 +719,55 @@ test('velocity-adaptive crate/ball sub-stepping prevents tunneling through close
   // Release crate while facing right into closed Gate A
   stepWorld(world, level, { p1: { move: 0, jump: false, interact: false, grab: true } }, FIXED_DT);
   assert.equal(actor.holdingCrateId, null);
-  assert.ok(
-    crate.x + crate.w <= doorA.x + 0.5,
-    `Released crate (${crate.x + crate.w}) must never spawn inside closed gate (${doorA.x})`
+  const overlapsGate =
+    crate.x < doorA.x + doorA.w &&
+    crate.x + crate.w > doorA.x &&
+    crate.y < doorA.y + doorA.h &&
+    crate.y + crate.h > doorA.y;
+  assert.equal(
+    overlapsGate,
+    false,
+    `Released crate (${crate.x},${crate.y}) must never spawn inside closed gate (${doorA.x},${doorA.y})`
   );
 });
 
 
 
+
+test('teammate stacking tags both actors and distinguishes deliberate from accidental', () => {
+  const level = getLevelById('level-1');
+  const place = (world: ReturnType<typeof createWorld>, jumped: boolean) => {
+    const bottom = world.actors[0];
+    const top = world.actors[1];
+    bottom.x = 700;
+    bottom.y = 458;
+    bottom.vx = 0;
+    bottom.vy = 0;
+    bottom.grounded = true;
+    top.x = 700;
+    top.y = bottom.y - top.h - 2;
+    top.vx = 0;
+    top.vy = 120;
+    top.grounded = false;
+    top.lastJumpTick = jumped ? world.tick - 12 : -500;
+  };
+
+  const deliberateWorld = createWorld(level, [
+    { id: 'bottom', name: 'Bottom', role: 'agent' },
+    { id: 'top', name: 'Top', role: 'agent' },
+  ]);
+  place(deliberateWorld, true);
+  for (let i = 0; i < 4; i++) stepWorld(deliberateWorld, level, {}, FIXED_DT);
+  assert.equal(deliberateWorld.actors[1].standingOnActorId, 'bottom');
+  assert.equal(deliberateWorld.actors[0].supportingActorId, 'top');
+  assert.equal(deliberateWorld.actors[1].stackKind, 'deliberate');
+
+  const accidentalWorld = createWorld(level, [
+    { id: 'bottom', name: 'Bottom', role: 'agent' },
+    { id: 'top', name: 'Top', role: 'agent' },
+  ]);
+  place(accidentalWorld, false);
+  for (let i = 0; i < 4; i++) stepWorld(accidentalWorld, level, {}, FIXED_DT);
+  assert.equal(accidentalWorld.actors[1].standingOnActorId, 'bottom');
+  assert.equal(accidentalWorld.actors[1].stackKind, 'accidental');
+});

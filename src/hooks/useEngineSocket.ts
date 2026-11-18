@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   ActorInput,
   ActorRole,
+  AgentMessageKind,
   ClientWsMessage,
   PhysicsConfig,
   SandboxAction,
@@ -24,6 +25,7 @@ export interface EngineConnectionState {
     value?: number | string | boolean | Partial<PhysicsConfig>
   ) => void;
   sendSandbox: (payload: SandboxAction) => void;
+  sendMessage: (actorId: string | null | undefined, text: string, kind?: AgentMessageKind) => void;
 }
 
 export function useEngineSocket(): EngineConnectionState {
@@ -167,6 +169,15 @@ export function useEngineSocket(): EngineConnectionState {
     [sendRaw]
   );
 
+  const sendMessage = useCallback(
+    (actorId: string | null | undefined, text: string, kind?: AgentMessageKind) => {
+      const clean = text.trim();
+      if (!clean) return;
+      sendRaw({ type: 'message', actorId: actorId ?? undefined, text: clean, kind });
+    },
+    [sendRaw]
+  );
+
   return {
     world,
     worldRef,
@@ -179,5 +190,6 @@ export function useEngineSocket(): EngineConnectionState {
     sendInput,
     sendControl,
     sendSandbox,
+    sendMessage,
   };
 }

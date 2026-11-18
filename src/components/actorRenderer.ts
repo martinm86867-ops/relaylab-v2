@@ -1,7 +1,63 @@
 import type { ActorState, CrateState, Vec2 } from '../engine/types';
 import { getActorArchetype } from './ActorAvatar';
 
-export type EmoteKind = 'exit' | 'alert' | 'bounce' | 'strain' | 'spark';
+export type EmoteKind = 'exit' | 'alert' | 'bounce' | 'strain' | 'spark' | 'curious' | 'content' | 'impatient' | 'stretch';
+
+type IdleStyle = 'tap' | 'sway' | 'scan' | 'stretch';
+type IdleFidgetKind = 'tap' | 'sway' | 'scan' | 'stretch';
+
+interface ActorPersonality {
+  tempo: number;
+  bobAmp: number;
+  blinkMin: number;
+  blinkMax: number;
+  style: IdleStyle;
+  fidgetMin: number;
+  fidgetMax: number;
+  tiltBias: number;
+}
+
+function hashString(value: string): number {
+  let hash = 2166136261;
+  for (let i = 0; i < value.length; i++) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function personalityFor(actor: ActorState): ActorPersonality {
+  const archetype = getActorArchetype(actor.role, actor.color);
+  const seed = hashString(`${actor.id}|${actor.name}|${actor.role}`);
+  const unit = (salt: number) => {
+    let value = (seed ^ Math.imul(salt + 1, 0x9e3779b1)) >>> 0;
+    value ^= value >>> 16;
+    value = Math.imul(value, 0x85ebca6b) >>> 0;
+    value ^= value >>> 13;
+    return (value >>> 0) / 4294967296;
+  };
+  const styleRoll = unit(3);
+  let style: IdleStyle;
+  if (archetype === 'operator') {
+    style = styleRoll < 0.55 ? 'sway' : styleRoll < 0.85 ? 'tap' : 'stretch';
+  } else if (archetype === 'alpha') {
+    style = styleRoll < 0.5 ? 'scan' : styleRoll < 0.8 ? 'tap' : 'stretch';
+  } else if (archetype === 'beta') {
+    style = styleRoll < 0.5 ? 'sway' : styleRoll < 0.8 ? 'stretch' : 'scan';
+  } else {
+    style = styleRoll < 0.55 ? 'scan' : styleRoll < 0.85 ? 'sway' : 'tap';
+  }
+  return {
+    tempo: 0.82 + unit(4) * 0.34,
+    bobAmp: 0.55 + unit(5) * 0.55,
+    blinkMin: 1.9 + unit(6) * 2.2,
+    blinkMax: 4.2 + unit(7) * 3.2,
+    style,
+    fidgetMin: 2.6 + unit(8) * 2.0,
+    fidgetMax: 4.6 + unit(9) * 3.0,
+    tiltBias: (unit(10) - 0.5) * 0.09,
+  };
+}
 
 export interface ActorAnimState {
   x: number;
@@ -26,6 +82,20 @@ export interface ActorAnimState {
   trail: Array<{ x: number; y: number; alpha: number }>;
   idleSeconds: number;
   emote: { kind: EmoteKind; ttl: number; maxTtl: number } | null;
+  personality: ActorPersonality;
+  idleFidget: { kind: IdleFidgetKind; ttl: number; maxTtl: number } | null;
+  fidgetTimer: number;
+  headTilt: number;
+  gazeX: number;
+  gazeY: number;
+  startleTimer: number;
+  pickupTimer: number;
+  stackRole: 'top' | 'bottom' | null;
+  stackKind: 'deliberate' | 'accidental' | null;
+  stackMateId: string | null;
+  stackTimer: number;
+  stackWobble: number;
+  stackOffset: number;
 }
 
 export interface ParticleSpawnFn {
@@ -76,6 +146,20 @@ export function createActorAnimState(actor: ActorState): ActorAnimState {
     trail: [],
     idleSeconds: 0,
     emote: null,
+    personality: personalityFor(actor),
+    idleFidget: null,
+    fidgetTimer: 0.9 + Math.random() * 1.5,
+    headTilt: 0,
+    gazeX: actor.facing * 0.6,
+    gazeY: 0,
+    startleTimer: 0,
+    pickupTimer: 0,
+    stackRole: null,
+    stackKind: null,
+    stackMateId: null,
+    stackTimer: 0,
+    stackWobble: 0,
+    stackOffset: 0,
   };
 }
 
@@ -88,7 +172,9 @@ export function updateActorAnimState(
   actor: ActorState,
   crates: CrateState[],
   dt: number,
-  spawnParticles: ParticleSpawnFn
+  spawnParticles: ParticleSpawnFn,
+  teammates: ActorState[] = [],
+  now = 0
 ): { landedIntensity: number; bounced: boolean; grabbed: boolean; threw: boolean } {
   const dist = Math.hypot(actor.x - anim.x, actor.y - anim.y);
   let teleported = false;
@@ -105,6 +191,117 @@ export function updateActorAnimState(
   const prevVx = anim.vx;
   anim.vx += (actor.vx - anim.vx) * Math.min(1, 22 * dt);
   anim.vy += (actor.vy - anim.vy) * Math.min(1, 22 * dt);
+
+  // Contextual gaze: prefer the held crate, then the agent's deliberate target,
+  // then a nearby teammate or loose crate. Fast movement keeps the eyes forward.
+  const selfCx = anim.x + actor.w * 0.5;
+  const selfCy = anim.y + actor.h * 0.45;
+  let gazeTargetX = selfCx + actor.facing * 60;
+  let gazeTargetY = selfCy;
+  let hasGazeTarget = false;
+  if (actor.holdingCrateId) {
+    const held = crates.find((crate) => crate.id === actor.holdingCrateId);
+    if (held) {
+      gazeTargetX = held.x + held.w * 0.5;
+      gazeTargetY = held.y + held.h * 0.5;
+      hasGazeTarget = true;
+    }
+  } else if (actor.role === 'agent' && actor.lastInput.targetPos && Math.abs(actor.vx) < 150) {
+    gazeTargetX = actor.lastInput.targetPos.x;
+    gazeTargetY = actor.lastInput.targetPos.y;
+    hasGazeTarget = true;
+  } else if (Math.abs(actor.vx) < 120) {
+    let bestDist = 210;
+    for (const mate of teammates) {
+      if (mate.id === actor.id || mate.onExit) continue;
+      const dx = mate.x + mate.w * 0.5 - selfCx;
+      const dy = mate.y + mate.h * 0.5 - selfCy;
+      const dist = Math.hypot(dx, dy);
+      if (dist < bestDist) {
+        bestDist = dist;
+        gazeTargetX = mate.x + mate.w * 0.5;
+        gazeTargetY = mate.y + mate.h * 0.45;
+        hasGazeTarget = true;
+      }
+    }
+    if (!hasGazeTarget) {
+      bestDist = 150;
+      for (const crate of crates) {
+        if (crate.id === actor.holdingCrateId) continue;
+        const dx = crate.x + crate.w * 0.5 - selfCx;
+        const dy = crate.y + crate.h * 0.5 - selfCy;
+        const dist = Math.hypot(dx, dy);
+        if (dist < bestDist) {
+          bestDist = dist;
+          gazeTargetX = crate.x + crate.w * 0.5;
+          gazeTargetY = crate.y + crate.h * 0.45;
+          hasGazeTarget = true;
+        }
+      }
+    }
+  }
+  if (Math.abs(actor.vx) > 170) {
+    gazeTargetX = selfCx + actor.facing * 80;
+    gazeTargetY = selfCy;
+    hasGazeTarget = true;
+  }
+  const desiredGazeX = hasGazeTarget ? clamp((gazeTargetX - selfCx) / 72, -1, 1) : actor.facing * 0.55;
+  const desiredGazeY = hasGazeTarget ? clamp((gazeTargetY - selfCy) / 52, -1, 1) : 0;
+  let stackGazeY = 0;
+  if (actor.standingOnActorId) stackGazeY = 0.7;
+  else if (actor.supportingActorId) stackGazeY = -0.7;
+  const finalGazeY = stackGazeY !== 0 ? stackGazeY : desiredGazeY;
+  anim.gazeX += (desiredGazeX - anim.gazeX) * Math.min(1, 7 * dt);
+  anim.gazeY += (finalGazeY - anim.gazeY) * Math.min(1, 7 * dt);
+
+  // Stacks are relationships, not just collisions: one actor carries another.
+  // The engine tags both participants, including whether the arrival was a
+  // deliberate jump or an accidental fall, so both characters react together.
+  const stackRole = actor.standingOnActorId ? 'top' : actor.supportingActorId ? 'bottom' : null;
+  const stackMateId = actor.standingOnActorId ?? actor.supportingActorId ?? null;
+  if (stackRole && (anim.stackRole !== stackRole || anim.stackMateId !== stackMateId)) {
+    const impact = Math.abs(anim.prevVy);
+    anim.stackRole = stackRole;
+    anim.stackMateId = stackMateId;
+    anim.stackKind = actor.stackKind ?? 'accidental';
+    anim.stackTimer = 0;
+    anim.stackWobble = stackRole === 'top'
+      ? clamp(impact / 430 + 0.2, 0.3, 1)
+      : 0.55;
+    anim.idleFidget = null;
+    anim.fidgetTimer = Math.max(anim.fidgetTimer, 2.2);
+    const contactY = stackRole === 'top' ? actor.y + actor.h : actor.y;
+    spawnParticles({
+      x: anim.x + actor.w * 0.5,
+      y: contactY,
+      count: anim.stackKind === 'deliberate' ? 5 : 9,
+      color: stackRole === 'top' ? actor.color : '#CBD5E1',
+      spreadVx: anim.stackKind === 'deliberate' ? 45 : 95,
+      spreadVy: 30,
+      size: 2.2,
+      shape: 'circle',
+      gravityScale: 0.1,
+    });
+    anim.emote = stackRole === 'top'
+      ? { kind: anim.stackKind === 'deliberate' ? 'spark' : 'alert', ttl: 0.9, maxTtl: 0.9 }
+      : { kind: anim.stackKind === 'deliberate' ? 'content' : 'strain', ttl: 0.9, maxTtl: 0.9 };
+    if (anim.stackKind === 'accidental') anim.startleTimer = 0.45;
+    anim.antennaVel += (Math.random() > 0.5 ? 1 : -1) * (anim.stackKind === 'accidental' ? 5 : 2.2);
+  } else if (stackRole) {
+    anim.stackTimer += dt;
+    anim.stackWobble = Math.max(0, anim.stackWobble - dt * 1.35);
+    const mate = teammates.find((m) => m.id === stackMateId);
+    if (mate) {
+      anim.stackOffset =
+        actor.x + actor.w * 0.5 - (mate.x + mate.w * 0.5);
+    }
+  } else if (anim.stackRole) {
+    anim.stackRole = null;
+    anim.stackKind = null;
+    anim.stackMateId = null;
+    anim.stackTimer = 0;
+    anim.stackWobble = 0;
+  }
 
   let landedIntensity = 0;
   let bounced = false;
@@ -168,6 +365,7 @@ export function updateActorAnimState(
         gravityScale: 0.2,
       });
       anim.antennaVel += (Math.random() > 0.5 ? 1 : -1) * (5 + landedIntensity * 10);
+      if (landedIntensity > 0.5) anim.startleTimer = 0.4;
     }
   }
 
@@ -191,6 +389,7 @@ export function updateActorAnimState(
   // Grab / throw detection
   if (!anim.prevHoldingId && actor.holdingCrateId) {
     grabbed = true;
+    anim.pickupTimer = 0.34;
     spawnParticles({
       x: anim.x + actor.w * 0.5 + actor.facing * 12,
       y: anim.y + 4,
@@ -329,7 +528,7 @@ export function updateActorAnimState(
   if (anim.isBlinking) {
     if (anim.blinkTimer <= 0) {
       anim.isBlinking = false;
-      anim.blinkTimer = 2.2 + Math.random() * 3.2;
+      anim.blinkTimer = anim.personality.blinkMin + Math.random() * (anim.personality.blinkMax - anim.personality.blinkMin);
     }
   } else if (anim.blinkTimer <= 0) {
     anim.isBlinking = true;
@@ -369,12 +568,65 @@ export function updateActorAnimState(
     }
   }
 
-  // Idle timer for subtle personality glances
-  if (actor.grounded && Math.abs(actor.vx) < 12 && !actor.holdingCrateId) {
+  // Idle timer and personality fidgets
+  const isIdle =
+    actor.grounded &&
+    Math.abs(actor.vx) < 12 &&
+    !actor.holdingCrateId &&
+    !actor.onExit &&
+    !actor.standingOnActorId &&
+    !actor.supportingActorId;
+  if (isIdle) {
     anim.idleSeconds += dt;
+    anim.fidgetTimer -= dt;
+    if (anim.fidgetTimer <= 0 && !anim.idleFidget && !anim.emote) {
+      const style = anim.personality.style;
+      const roll = Math.random();
+      const kind: IdleFidgetKind =
+        roll < 0.72
+          ? style
+          : (['tap', 'sway', 'scan', 'stretch'] as const)[Math.floor(Math.random() * 4)];
+      const ttl = kind === 'stretch' ? 1.8 : kind === 'scan' ? 1.9 : 1.4;
+      anim.idleFidget = { kind, ttl, maxTtl: ttl };
+      if (!anim.emote) {
+        const emoteKind: EmoteKind =
+          kind === 'scan' ? 'curious' : kind === 'sway' ? 'content' : kind === 'tap' ? 'impatient' : 'stretch';
+        anim.emote = { kind: emoteKind, ttl: 1.4, maxTtl: 1.4 };
+      }
+      anim.fidgetTimer =
+        anim.personality.fidgetMin + Math.random() * (anim.personality.fidgetMax - anim.personality.fidgetMin);
+      anim.antennaVel += (Math.random() > 0.5 ? 1 : -1) * (kind === 'stretch' ? 3.4 : 2.1);
+    }
   } else {
     anim.idleSeconds = 0;
+    anim.idleFidget = null;
+    anim.fidgetTimer = Math.max(anim.fidgetTimer, 1.4);
   }
+
+  if (anim.idleFidget) {
+    anim.idleFidget.ttl -= dt;
+    if (anim.idleFidget.ttl <= 0) anim.idleFidget = null;
+  }
+
+  // Personality head tilt: a slow resting bias, a tilt into a fidget, and a
+  // small recoil after a heavy landing. Kept separate from leanAngle.
+  let targetHeadTilt = anim.personality.tiltBias + Math.sin(now * 0.0014 + actor.spawnIndex * 1.9) * 0.012;
+  if (anim.idleFidget?.kind === 'sway') {
+    targetHeadTilt += Math.sin(now * 0.0045 + actor.spawnIndex) * 0.075;
+  } else if (anim.idleFidget?.kind === 'scan') {
+    targetHeadTilt += Math.sin(now * 0.006 + actor.spawnIndex) * 0.12;
+  } else if (anim.idleFidget?.kind === 'stretch') {
+    targetHeadTilt += Math.sin((1 - anim.idleFidget.ttl / anim.idleFidget.maxTtl) * Math.PI) * 0.08;
+  } else if (isIdle && Math.abs(actor.vx) < 40) {
+    // Lean the head a little toward whatever the eyes are attending to.
+    targetHeadTilt += anim.gazeX * 0.035;
+  }
+  if (isActorPushingCrate(actor, crates) || actor.holdingCrateId) targetHeadTilt = 0;
+  if (anim.stackRole === 'top') targetHeadTilt += actor.facing * 0.045;
+  else if (anim.stackRole === 'bottom') targetHeadTilt -= actor.facing * 0.06;
+  if (anim.startleTimer > 0) targetHeadTilt -= actor.facing * 0.09;
+  anim.headTilt += (targetHeadTilt - anim.headTilt) * Math.min(1, 9 * dt);
+  anim.startleTimer = Math.max(0, anim.startleTimer - dt);
 
   if (anim.emote) {
     anim.emote.ttl -= dt;
@@ -383,6 +635,7 @@ export function updateActorAnimState(
 
   anim.wasGrounded = actor.grounded;
   anim.prevVy = actor.vy;
+  anim.pickupTimer = Math.max(0, anim.pickupTimer - dt);
 
   return { landedIntensity, bounced, grabbed, threw };
 }
@@ -414,26 +667,24 @@ export function drawActorCharacter(
   const isHolding = Boolean(actor.holdingCrateId);
   const isPushing = isActorPushingCrate(actor, crates);
   const isAirborne = !actor.grounded;
+  const fidget = anim.idleFidget;
+  const fidgetProgress = fidget ? 1 - fidget.ttl / fidget.maxTtl : 0;
+  const fidgetEnvelope = fidget ? Math.sin(Math.PI * clamp(fidgetProgress, 0, 1)) : 0;
+  const fidgetKind = fidget?.kind ?? null;
+  const stackTop = anim.stackRole === 'top';
+  const stackBottom = anim.stackRole === 'bottom';
+  const stackWobble = anim.stackWobble;
+  const stackBrace = stackBottom ? Math.max(0, 1 - anim.stackTimer / 0.55) : 0;
+  const stackBalance = stackTop ? clamp(stackWobble * 1.15 + (anim.stackKind === 'deliberate' ? 0.25 : 0), 0, 1) : 0;
+  const stackBracePose = stackBottom ? clamp(1 - anim.stackTimer / 1.1, 0, 1) : 0;
+  const isTap = fidgetKind === 'tap';
+  const isSway = fidgetKind === 'sway';
+  const isStretch = fidgetKind === 'stretch';
+  const isScan = fidgetKind === 'scan';
 
   const heldCrate = isHolding ? crates.find((c) => c.id === actor.holdingCrateId) : undefined;
-
-  // Draw glowing magnetic cradle tether if carrying a crate
-  if (heldCrate) {
-    const hcx = heldCrate.x + heldCrate.w * 0.5;
-    const hcy = heldCrate.y + heldCrate.h * 0.5;
-    ctx.save();
-    ctx.strokeStyle = actor.color;
-    ctx.globalAlpha = 0.55 + 0.2 * Math.sin(now * 0.015);
-    ctx.lineWidth = 2;
-    ctx.setLineDash([4, 3]);
-    ctx.beginPath();
-    ctx.moveTo(cx - 5, anim.y + 4);
-    ctx.lineTo(hcx - 4, hcy);
-    ctx.moveTo(cx + 5, anim.y + 4);
-    ctx.lineTo(hcx + 4, hcy);
-    ctx.stroke();
-    ctx.restore();
-  }
+  const pickupProgress = isHolding ? clamp(1 - anim.pickupTimer / 0.34, 0, 1) : 1;
+  const carryLift = pickupProgress * pickupProgress * (3 - 2 * pickupProgress);
 
   // Draw Operator's trailing scarf (in world space behind the body)
   if (archetype === 'operator') {
@@ -487,26 +738,90 @@ export function drawActorCharacter(
   }
   ctx.restore();
 
+  if (stackTop) {
+    // Pressure line at the contact point: green for a chosen stack, amber for
+    // a stumble. It also anchors the rider to the carrier's helmet.
+    ctx.save();
+    ctx.strokeStyle = anim.stackKind === 'deliberate' ? 'rgba(52, 211, 153, 0.62)' : 'rgba(251, 191, 36, 0.62)';
+    ctx.lineWidth = 1.3;
+    ctx.beginPath();
+    ctx.moveTo(cx - 7.5, bottomY + 0.6);
+    ctx.lineTo(cx + 7.5, bottomY + 0.6);
+    ctx.stroke();
+    ctx.fillStyle = anim.stackKind === 'deliberate' ? 'rgba(52, 211, 153, 0.22)' : 'rgba(251, 191, 36, 0.22)';
+    ctx.beginPath();
+    ctx.ellipse(cx, bottomY + 0.6, 10, 2.2, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
   // Main articulated body transform
   ctx.save();
   ctx.translate(cx, bottomY);
-  ctx.rotate(anim.leanAngle);
-  ctx.scale(actor.squashX, actor.squashY);
+  const stackLean = stackTop ? Math.sin(now * 0.032 + actor.spawnIndex) * 0.045 * stackWobble : 0;
+  ctx.rotate(anim.leanAngle + stackLean);
+  ctx.scale(
+    actor.squashX * (1 + 0.025 * stackBrace),
+    actor.squashY * (1 - 0.055 * stackBrace)
+  );
+  const weightShift = !isMoving && !isAirborne
+    ? Math.sin(now * 0.0011 * anim.personality.tempo + actor.spawnIndex * 1.3) * 0.55 * anim.personality.bobAmp
+    : 0;
+  const stackSway = stackTop
+    ? Math.sin(now * 0.03 + actor.spawnIndex * 1.7) *
+      (1.4 + Math.min(4, Math.abs(anim.stackOffset) * 0.12)) *
+      stackWobble
+    : 0;
+  const swayX =
+    (isSway ? Math.sin(now * 0.0045 + actor.spawnIndex) * 2.2 * fidgetEnvelope : 0) +
+    weightShift +
+    stackSway;
+  ctx.translate(swayX, 0);
 
   if (actor.respawnTimer > 0) {
     ctx.globalAlpha = Math.sin(now * 0.04) > 0 ? 1 : 0.32;
   }
 
-  const idleBob = !isMoving && !isAirborne ? Math.sin(now * 0.005 + actor.spawnIndex * 1.7) * 0.8 : 0;
+  const idleBob = !isMoving && !isAirborne
+    ? Math.sin(now * 0.005 * anim.personality.tempo + actor.spawnIndex * 1.7) * 0.8 * anim.personality.bobAmp
+    : 0;
   const runBounce = isMoving ? Math.abs(Math.sin(anim.walkPhase)) * -1.8 : 0;
-  const bodyOffsetY = idleBob + runBounce;
+  const stretch = isStretch
+    ? fidgetEnvelope
+    : actor.onExit && !isHolding
+      ? 0.5 + 0.18 * Math.sin(now * 0.006)
+      : 0;
+  const stretchLift = -2.2 * stretch;
+  const exitHop = actor.onExit && actor.grounded ? -Math.abs(Math.sin(now * 0.006 + actor.spawnIndex)) * 1.2 : 0;
+  const pickupDip = isHolding ? -Math.sin(pickupProgress * Math.PI) * 1.4 : 0;
+  const stackDip = stackBottom
+    ? -Math.sin(clamp(anim.stackTimer / 0.45, 0, 1) * Math.PI) * 1.3
+    : 0;
+  const bodyOffsetY = idleBob + runBounce + stretchLift + exitHop + pickupDip + stackDip;
+  const tapLift = isTap ? Math.max(0, Math.sin(fidgetProgress * Math.PI * 4)) * 2.6 * fidgetEnvelope : 0;
 
   const stride = isMoving ? Math.sin(anim.walkPhase) : 0;
   const liftL = isMoving ? Math.max(0, Math.cos(anim.walkPhase)) * 3.5 : 0;
   const liftR = isMoving ? Math.max(0, -Math.cos(anim.walkPhase)) * 3.5 : 0;
 
   // --- 1. Back Arm (behind torso, at front/far shoulder) ---
-  drawArm(ctx, actor.facing * 9, -13 + bodyOffsetY, actor.facing, stride, isHolding, isPushing, isAirborne, actor.vy, actor.color, true);
+  drawArm(
+    ctx,
+    actor.facing * 9,
+    -13 + bodyOffsetY,
+    actor.facing,
+    stride,
+    isHolding,
+    isPushing,
+    isAirborne,
+    actor.vy,
+    actor.color,
+    true,
+    stretch,
+    carryLift,
+    stackBalance,
+    stackBracePose
+  );
 
   // --- 2. Articulated Legs & Boots ---
   const legSpread = isAirborne ? (actor.vy < 0 ? 3.5 : 5.5) : 4.8;
@@ -515,8 +830,8 @@ export function drawActorCharacter(
   const airTuckL = isAirborne ? (actor.vy < 0 ? -3.5 : -1) : -liftL;
   const airTuckR = isAirborne ? (actor.vy < 0 ? -1.5 : -2.5) : -liftR;
 
-  drawFoot(ctx, leftFootX, airTuckL, actor.facing, archetype, actor.color, true);
-  drawFoot(ctx, rightFootX, airTuckR, actor.facing, archetype, actor.color, false);
+  drawFoot(ctx, leftFootX - swayX, airTuckL, actor.facing, archetype, actor.color, true);
+  drawFoot(ctx, rightFootX - swayX, airTuckR - tapLift, actor.facing, archetype, actor.color, false);
 
   // --- 3. Torso & Head Silhouette ---
   const bodyTop = -actor.h + 4 + bodyOffsetY;
@@ -556,7 +871,7 @@ export function drawActorCharacter(
   }
 
   // Secondary Headgear (behind or atop chassis)
-  drawHeadgear(ctx, archetype, bodyTop, actor.facing, anim.antennaAngle, actor.color, actor.onExit, now);
+  drawHeadgear(ctx, archetype, bodyTop, actor.facing, anim.antennaAngle, anim.headTilt, actor.color, actor.onExit, now);
 
   // Main Chassis with directional sculptural shading
   const defineChassisPath = () => {
@@ -606,14 +921,20 @@ export function drawActorCharacter(
   // Chest Core / Suit Trim
   drawChestDetail(ctx, archetype, bodyTop + bodyH - 8, actor.facing, actor.color, actor.onExit, isPushing || isHolding, now);
 
-  // --- 4. Expressive Faceplate & Eyes ---
-  let lookOffsetX = actor.facing * 3.6 + clamp(actor.vx * 0.008, -1.5, 1.5);
+  // --- 4. Expressive Faceplate & Eyes (subtle head tilt + contextual gaze) ---
+  ctx.save();
+  const headPivotY = bodyTop + 10;
+  ctx.translate(0, headPivotY);
+  ctx.rotate(anim.headTilt);
+  ctx.translate(0, -headPivotY);
+  let lookOffsetX = actor.facing * 3.6 + clamp(actor.vx * 0.008, -1.5, 1.5) + anim.gazeX * 2.4;
   if (actor.role === 'agent' && actor.lastInput.targetPos && Math.abs(actor.vx) < 25) {
     lookOffsetX += clamp((actor.lastInput.targetPos.x - cx) * 0.02, -2.2, 2.2);
   } else if (anim.idleSeconds > 1.2) {
     lookOffsetX += Math.sin(now * 0.0016 + actor.spawnIndex * 2.1) * 1.6;
   }
-  const eyeShiftY = clamp(actor.vy * 0.003, -1.2, 1.4);
+  if (isScan) lookOffsetX += Math.sin(now * 0.009 + actor.spawnIndex) * 2.3 * fidgetEnvelope;
+  const eyeShiftY = clamp(actor.vy * 0.003, -1.2, 1.4) + anim.gazeY * 1.1;
   const visorX = -9.5 + lookOffsetX * 0.42;
   const visorY = bodyTop + 5;
   const visorW = 19;
@@ -637,11 +958,19 @@ export function drawActorCharacter(
     actor.color,
     {
       isBlinking: anim.isBlinking,
-      isHappy: actor.onExit,
+      isHappy:
+        actor.onExit ||
+        (stackTop && anim.stackKind === 'deliberate' && anim.stackTimer > 0.18 && anim.stackTimer < 1.25),
       isRespawning: actor.respawnTimer > 0,
-      isStraining: isPushing || isHolding,
-      isStartled: isAirborne && Math.abs(actor.vy) > 380,
+      isStraining: isPushing || isHolding || (stackBottom && anim.stackKind === 'accidental' && anim.stackTimer < 0.8),
+      isStartled:
+        (isAirborne && Math.abs(actor.vy) > 380) ||
+        anim.startleTimer > 0 ||
+        (stackTop && anim.stackKind === 'accidental' && anim.stackTimer < 0.75),
       facing: actor.facing,
+      gazeX: anim.gazeX,
+      gazeY: anim.gazeY,
+      fidgetKind,
     }
   );
 
@@ -665,6 +994,7 @@ export function drawActorCharacter(
   ctx.beginPath();
   ctx.roundRect(visorX, visorY, visorW, visorH, visorR);
   ctx.stroke();
+  ctx.restore();
 
   // --- 5. Front Arm (foreground, anchored at back shoulder below visor) ---
   drawArm(
@@ -678,7 +1008,11 @@ export function drawActorCharacter(
     isAirborne,
     actor.vy,
     actor.color,
-    false
+    false,
+    stretch,
+    carryLift,
+    stackBalance,
+    stackBracePose
   );
 
   ctx.restore();
@@ -686,6 +1020,7 @@ export function drawActorCharacter(
   // --- 6. Minimal Floating Markers & Optional Agent Plans ---
   ctx.save();
   ctx.textAlign = 'center';
+  const carryClearance = heldCrate ? heldCrate.h + 6 : 0;
 
   // Micro Emote Bubble
   if (anim.emote) {
@@ -703,7 +1038,7 @@ export function drawActorCharacter(
   if (actor.role === 'human') {
     if (actor.holdingCrateId) {
       // Compact [Q] throw keycap above held crate
-      const ky = anim.y - 34;
+      const ky = anim.y - (heldCrate?.h ?? 0) - 12;
       ctx.fillStyle = '#0B1018';
       ctx.beginPath();
       ctx.roundRect(cx - 8, ky - 7, 16, 15, 3.5);
@@ -734,9 +1069,9 @@ export function drawActorCharacter(
     // Clean unboxed agent callsign + lightweight intent readout when Plans are enabled
     ctx.font = '600 9.5px "JetBrains Mono", monospace';
     ctx.fillStyle = 'rgba(11, 16, 24, 0.75)';
-    ctx.fillText(actor.label, cx + 1, anim.y - 9);
+    ctx.fillText(actor.label, cx + 1, anim.y - 9 - carryClearance);
     ctx.fillStyle = actor.color;
-    ctx.fillText(actor.label, cx, anim.y - 10);
+    ctx.fillText(actor.label, cx, anim.y - 10 - carryClearance);
 
     if (actor.lastInput.intent) {
       const tag = actor.lastInput.intent;
@@ -746,13 +1081,13 @@ export function drawActorCharacter(
       const padW = Math.min(148, metrics.width + 12);
       ctx.fillStyle = 'rgba(11, 16, 24, 0.78)';
       ctx.beginPath();
-      ctx.roundRect(cx - padW * 0.5, anim.y - 36, padW, 14, 4);
+      ctx.roundRect(cx - padW * 0.5, anim.y - 36 - carryClearance, padW, 14, 4);
       ctx.fill();
       ctx.strokeStyle = isWaiting ? 'rgba(245, 158, 11, 0.42)' : 'rgba(148, 163, 184, 0.24)';
       ctx.lineWidth = 1;
       ctx.stroke();
       ctx.fillStyle = '#E2E8F0';
-      ctx.fillText(tag, cx, anim.y - 26, 140);
+      ctx.fillText(tag, cx, anim.y - 26 - carryClearance, 140);
     }
   }
   ctx.restore();
@@ -768,6 +1103,14 @@ function getEmoteVisual(kind: EmoteKind, actorColor: string): { text: string; co
       return { text: '⚡', color: '#FDE68A' };
     case 'spark':
       return { text: '✦', color: '#FB7185' };
+    case 'curious':
+      return { text: '?', color: '#FDE68A' };
+    case 'content':
+      return { text: '♪', color: '#A5F3FC' };
+    case 'impatient':
+      return { text: '…', color: actorColor };
+    case 'stretch':
+      return { text: '✦', color: '#F8FAFC' };
     default:
       return { text: '!', color: actorColor };
   }
@@ -818,7 +1161,11 @@ function drawArm(
   isAirborne: boolean,
   vy: number,
   color: string,
-  isBack: boolean
+  isBack: boolean,
+  stretch = 0,
+  carryLift = 1,
+  balance = 0,
+  brace = 0
 ): void {
   ctx.save();
   ctx.translate(shoulderX, shoulderY);
@@ -828,17 +1175,20 @@ function drawArm(
   let elbowY: number | null = null;
 
   if (isHolding) {
-    // Route arms cleanly outside the head/visor up toward the overhead crate
+    // Reach from the shoulder to the underside of the overhead crate. During the
+    // first third of a second the hands start low and rise, so the pick reads as a lift.
+    const lift = clamp(carryLift, 0, 1);
+    const eased = lift * lift * (3 - 2 * lift);
     if (isBack) {
-      elbowX = facing * 6;
-      elbowY = -8;
-      handX = facing * 3;
-      handY = -20;
+      elbowX = facing * 4;
+      elbowY = -8 + (1 - eased) * 5;
+      handX = -facing * 19;
+      handY = 2 - 29 * eased;
     } else {
-      elbowX = -facing * 7;
-      elbowY = -9;
-      handX = facing * 1;
-      handY = -20;
+      elbowX = -facing * 5;
+      elbowY = -9 + (1 - eased) * 5;
+      handX = facing * 15;
+      handY = 2 - 29 * eased;
     }
   } else if (isPushing) {
     handX = facing * 7.5;
@@ -851,6 +1201,25 @@ function drawArm(
       handX = -facing * 5.5;
       handY = vy < 0 ? -4 : -7;
     }
+  } else if (stretch > 0) {
+    // A lazy stretch: both arms reach up past the shoulders and slightly outward.
+    handX = facing * (isBack ? 6.8 : -5.6) + (isBack ? 1 : -1) * stretch * 1.4;
+    handY = -14 - stretch * 6.5;
+    elbowX = handX * 0.45;
+    elbowY = -9 - stretch * 4.2;
+  } else if (balance > 0.01) {
+    // Tightrope balance: the arms fan out sideways while the rider settles.
+    const outward = 10.5 + balance * 4.5;
+    handX = (isBack ? -1 : 1) * facing * outward;
+    handY = -4 - balance * 2.5;
+    elbowX = handX * 0.48;
+    elbowY = -1.5;
+  } else if (brace > 0.01) {
+    // The carrier widens its stance with low, outward hands.
+    handX = (isBack ? -1 : 1) * facing * (8.5 + brace * 2.2);
+    handY = 1.5 + brace * 2.2;
+    elbowX = handX * 0.5;
+    elbowY = 0.5;
   }
 
   ctx.strokeStyle = isBack ? '#1E293B' : '#0F172A';
@@ -883,12 +1252,14 @@ function drawHeadgear(
   bodyTop: number,
   facing: 1 | -1,
   antennaAngle: number,
+  headTilt: number,
   color: string,
   onExit: boolean,
   now: number
 ): void {
   ctx.save();
   ctx.translate(0, bodyTop);
+  ctx.rotate(headTilt);
 
   if (archetype === 'operator') {
     // Field engineer helmet crest + headlamp nub
@@ -1044,6 +1415,9 @@ function drawEyes(
     isStraining: boolean;
     isStartled: boolean;
     facing: 1 | -1;
+    gazeX: number;
+    gazeY: number;
+    fidgetKind?: IdleFidgetKind | null;
   }
 ): void {
   const eyeColor =
@@ -1060,15 +1434,17 @@ function drawEyes(
   ctx.fillStyle = eyeColor;
   ctx.lineWidth = 1.6;
   ctx.lineCap = 'round';
+  const gx = state.gazeX * 1.25;
+  const gy = state.gazeY * 0.75;
 
   if (state.isRespawning) {
     // Dizzy X X eyes
     for (const ox of [-4, 4]) {
       ctx.beginPath();
-      ctx.moveTo(cx + ox - 1.8, cy - 1.8);
-      ctx.lineTo(cx + ox + 1.8, cy + 1.8);
-      ctx.moveTo(cx + ox + 1.8, cy - 1.8);
-      ctx.lineTo(cx + ox - 1.8, cy + 1.8);
+      ctx.moveTo(cx + ox + gx - 1.8, cy + gy - 1.8);
+      ctx.lineTo(cx + ox + gx + 1.8, cy + gy + 1.8);
+      ctx.moveTo(cx + ox + gx + 1.8, cy + gy - 1.8);
+      ctx.lineTo(cx + ox + gx - 1.8, cy + gy + 1.8);
       ctx.stroke();
     }
     ctx.restore();
@@ -1079,7 +1455,7 @@ function drawEyes(
     // Happy ^ ^ crescent eyes
     for (const ox of [-4.2, 4.2]) {
       ctx.beginPath();
-      ctx.arc(cx + ox, cy + 1.2, 2.6, Math.PI * 1.1, Math.PI * 1.9);
+      ctx.arc(cx + ox + gx, cy + 1.2 + gy, 2.6, Math.PI * 1.1, Math.PI * 1.9);
       ctx.stroke();
     }
     ctx.restore();
@@ -1088,10 +1464,10 @@ function drawEyes(
 
   if (state.isBlinking) {
     ctx.beginPath();
-    ctx.moveTo(cx - 6.2, cy);
-    ctx.lineTo(cx - 2, cy);
-    ctx.moveTo(cx + 2, cy);
-    ctx.lineTo(cx + 6.2, cy);
+    ctx.moveTo(cx - 6.2 + gx, cy + gy * 0.4);
+    ctx.lineTo(cx - 2 + gx, cy + gy * 0.4);
+    ctx.moveTo(cx + 2 + gx, cy + gy * 0.4);
+    ctx.lineTo(cx + 6.2 + gx, cy + gy * 0.4);
     ctx.stroke();
     ctx.restore();
     return;
@@ -1105,7 +1481,7 @@ function drawEyes(
     ctx.fill();
     ctx.fillStyle = '#ECFEFF';
     ctx.beginPath();
-    ctx.arc(cx + state.facing * 2.2, cy, state.isStartled ? 2 : 1.5, 0, Math.PI * 2);
+    ctx.arc(cx + state.facing * 2.2 + state.gazeX * 2, cy + gy, state.isStartled ? 2 : 1.5, 0, Math.PI * 2);
     ctx.fill();
     ctx.restore();
     return;
@@ -1114,12 +1490,12 @@ function drawEyes(
   if (state.isStraining) {
     // Focused > < determined eyes
     ctx.beginPath();
-    ctx.moveTo(cx - 5.5, cy - 1.8);
-    ctx.lineTo(cx - 2.5, cy);
-    ctx.lineTo(cx - 5.5, cy + 1.8);
-    ctx.moveTo(cx + 5.5, cy - 1.8);
-    ctx.lineTo(cx + 2.5, cy);
-    ctx.lineTo(cx + 5.5, cy + 1.8);
+    ctx.moveTo(cx - 5.5 + gx, cy + gy - 1.8);
+    ctx.lineTo(cx - 2.5 + gx, cy + gy);
+    ctx.lineTo(cx - 5.5 + gx, cy + gy + 1.8);
+    ctx.moveTo(cx + 5.5 + gx, cy + gy - 1.8);
+    ctx.lineTo(cx + 2.5 + gx, cy + gy);
+    ctx.lineTo(cx + 5.5 + gx, cy + gy + 1.8);
     ctx.stroke();
     ctx.restore();
     return;
@@ -1129,8 +1505,46 @@ function drawEyes(
     // Wide surprised O O eyes
     for (const ox of [-4, 4]) {
       ctx.beginPath();
-      ctx.arc(cx + ox, cy, 2.3, 0, Math.PI * 2);
+      ctx.arc(cx + ox + gx, cy + gy, 2.3, 0, Math.PI * 2);
       ctx.fill();
+    }
+    ctx.restore();
+    return;
+  }
+
+  if (state.fidgetKind) {
+    // Small idle expressions: curious, content, impatient, mid-stretch.
+    if (state.fidgetKind === 'scan') {
+      for (const [ox, radius] of [[-4.2, 2.3], [4.2, 2.0]] as const) {
+        ctx.beginPath();
+        ctx.arc(cx + ox + gx, cy + gy, radius, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(cx + ox + gx + 0.7, cy + gy + 0.4, 0.75, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    } else if (state.fidgetKind === 'sway') {
+      for (const ox of [-4.2, 4.2]) {
+        ctx.beginPath();
+        ctx.arc(cx + ox + gx, cy + 1.1 + gy, 2.5, Math.PI * 1.12, Math.PI * 1.88);
+        ctx.stroke();
+      }
+    } else if (state.fidgetKind === 'tap') {
+      // Half-lidded, mildly impatient: one flat eye, one round eye.
+      ctx.beginPath();
+      ctx.moveTo(cx - 6.2 + gx, cy + gy);
+      ctx.lineTo(cx - 2.1 + gx, cy + gy);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(cx + 3.9 + gx, cy + gy, 1.9, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      // Closed-eye stretch.
+      for (const ox of [-4.2, 4.2]) {
+        ctx.beginPath();
+        ctx.arc(cx + ox + gx, cy + 1.2 + gy, 2.2, Math.PI * 1.1, Math.PI * 1.9);
+        ctx.stroke();
+      }
     }
     ctx.restore();
     return;
@@ -1139,7 +1553,7 @@ function drawEyes(
   // Default expressive crisp eyes
   for (const ox of [-4, 4]) {
     ctx.beginPath();
-    ctx.roundRect(cx + ox - 1.8, cy - 2.4, 3.6, 4.8, 1.2);
+    ctx.roundRect(cx + ox + gx - 1.8, cy + gy - 2.4, 3.6, 4.8, 1.2);
     ctx.fill();
   }
   ctx.restore();

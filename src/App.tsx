@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { GameCanvas } from './components/GameCanvas';
 import { StatusModal } from './components/StatusModal';
+import { SpawnAiAgentModal, type SpawnAiAgentConfig } from './components/SpawnAiAgentModal';
 import { TelemetryDock, type InspectorTab } from './components/TelemetryDock';
 import { TitleScreen } from './components/TitleScreen';
 import { LEVELS } from './engine/levels';
@@ -30,7 +31,8 @@ const LEVEL_SHORT_LABELS: Record<string, string> = {
   'level-2': '02. Crate',
   'level-3': '03. Lift',
   'level-4': '04. Vault',
-  sandbox: '05. Sandbox',
+  'level-5': '05. Cascade',
+  sandbox: '06. Sandbox',
 };
 
 export default function App() {
@@ -45,6 +47,7 @@ export default function App() {
     sendInput,
     sendControl,
     sendSandbox,
+    sendMessage,
   } = useEngineSocket();
 
   const [shellState, setShellState] = useState<AppShellState>(() => {
@@ -58,6 +61,7 @@ export default function App() {
   });
 
   const [showAgentPlans, setShowAgentPlans] = useState(true);
+  const [aiSpawnOpen, setAiSpawnOpen] = useState(false);
   const [muted, setMuted] = useState(() => {
     try {
       return typeof window !== 'undefined' && window.localStorage.getItem('relaylab-muted') === '1';
@@ -146,6 +150,26 @@ export default function App() {
     role === 'human'
       ? assignedActorId ?? world?.actors.find((a) => a.role === 'human')?.id ?? null
       : null;
+
+  const handleSpawnAiAgent = useCallback(async (config: SpawnAiAgentConfig) => {
+    const response = await fetch('/api/agents/llm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config),
+    });
+    const data = (await response.json().catch(() => ({}))) as { error?: string };
+    if (!response.ok) {
+      throw new Error(data.error || `Could not spawn AI agent (${response.status})`);
+    }
+  }, []);
+
+  const handleSendSquadMessage = useCallback(
+    (text: string) => {
+      if (!humanActorId) return;
+      sendMessage(humanActorId, text, 'status');
+    },
+    [humanActorId, sendMessage]
+  );
 
   const focusCanvas = useCallback(() => {
     const active = document.activeElement as HTMLElement | null;
@@ -775,10 +799,18 @@ export default function App() {
           onUpdatePhysics={handleUpdatePhysics}
           onApplyPhysicsPreset={handleApplyPhysicsPreset}
           onSpawnAgent={() => sendControl('spawn_agent')}
+          onOpenAiAgentModal={() => setAiSpawnOpen(true)}
           onRemoveAgent={(id) => sendControl('remove_agent', id)}
           onToggleHuman={handleToggleHuman}
+          onSendMessage={handleSendSquadMessage}
         />
       )}
+
+      <SpawnAiAgentModal
+        open={aiSpawnOpen}
+        onClose={() => setAiSpawnOpen(false)}
+        onSpawn={handleSpawnAiAgent}
+      />
 
       {/* Title Screen Overlay */}
       {shellState === 'title' && (

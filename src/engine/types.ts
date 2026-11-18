@@ -95,7 +95,30 @@ export interface ActorState {
   decisionsCount: number;
   squashX: number;
   squashY: number;
+  /** External horizontal shove from a moving body, in px/s. */
+  knockbackVx?: number;
+  knockbackTimer?: number;
+  /** Tick when the actor last left the ground under its own jump input. */
+  lastJumpTick?: number;
+  /** Set each tick when this actor is standing on a teammate. */
+  standingOnActorId?: string | null;
+  /** Set each tick when a teammate is standing on this actor. */
+  supportingActorId?: string | null;
+  /** Why the current stack formed; shared by both participants. */
+  stackKind?: 'deliberate' | 'accidental' | null;
+  /** How this actor is driven. Absent means the legacy path (WS/direct API). */
+  controller?: 'builtin' | 'external' | 'llm';
+  provider?: string;
+  model?: string;
+  controlMode?: LlmControlMode;
+  agentStatus?: LlmAgentStatus;
+  agentError?: string;
+  lastDecisionLatencyMs?: number;
 }
+
+export type LlmControlMode = 'hybrid' | 'direct';
+
+export type LlmAgentStatus = 'idle' | 'thinking' | 'acting' | 'error' | 'stopped';
 
 export interface PlatformDef {
   id: string;
@@ -384,6 +407,36 @@ export interface AgentObservation {
   forceZones: ForceZoneDef[];
   messages: AgentMessage[];
   exit: ExitZone & { unlocked: boolean };
+  /** Static level metadata for LLM system context. Optional for backwards compatibility. */
+  level?: {
+    id: string;
+    name: string;
+    subtitle: string;
+    hint: string;
+    isSandbox: boolean;
+  };
+  /** Wall-clock-ish simulation clock, not a transport timestamp. */
+  clock?: {
+    tick: number;
+    seconds: number;
+    paused: boolean;
+    timeScale: number;
+  };
+  metrics?: {
+    actorsAtExit: number;
+    totalActors: number;
+    decisionsLogged: number;
+    solvedAtTick: number | null;
+  };
+  /** Last few public telemetry events (no hidden server state). */
+  recentEvents?: Array<{
+    id: string;
+    tick: number;
+    type: string;
+    message: string;
+    actorId?: string;
+    entityId?: string;
+  }>;
 }
 
 export interface TraceRecord {

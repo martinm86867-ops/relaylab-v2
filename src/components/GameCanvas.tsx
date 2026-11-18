@@ -1,7 +1,14 @@
 import { useEffect, useRef } from 'react';
 import { WORLD_HEIGHT, WORLD_WIDTH } from '../engine/levels';
 import { SANDBOX_TOOLS, type SandboxCanvasSelection } from '../engine/sandboxTools';
-import type { ChannelId, SandboxAction, SandboxSpawnKind, Vec2, WorldState } from '../engine/types';
+import type {
+  AgentMessage,
+  ChannelId,
+  SandboxAction,
+  SandboxSpawnKind,
+  Vec2,
+  WorldState,
+} from '../engine/types';
 import { soundFX } from '../utils/sound';
 import {
   createActorAnimState,
@@ -89,6 +96,122 @@ const AMBIENT_MOTES: AmbientMote[] = Array.from({ length: 24 }, (_, idx) => ({
   r: 1 + (idx % 2) * 0.8,
   alpha: 0.08 + (idx % 4) * 0.04,
 }));
+
+
+function wrapBubbleText(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  maxWidth: number,
+  maxLines: number
+): string[] {
+  const words = text.split(/\s+/).filter(Boolean);
+  const lines: string[] = [];
+  let current = '';
+  let truncated = false;
+  for (const word of words) {
+    if (lines.length >= maxLines) {
+      truncated = true;
+      break;
+    }
+    const candidate = current ? `${current} ${word}` : word;
+    if (ctx.measureText(candidate).width <= maxWidth) {
+      current = candidate;
+      continue;
+    }
+    if (current) {
+      lines.push(current);
+      current = '';
+      if (lines.length >= maxLines) {
+        truncated = true;
+        break;
+      }
+    }
+    let next = word;
+    while (next.length > 1 && ctx.measureText(next).width > maxWidth) {
+      next = next.slice(0, -1);
+      truncated = true;
+    }
+    current = next;
+  }
+  if (current && lines.length < maxLines) {
+    lines.push(current);
+  } else if (current) {
+    truncated = true;
+  }
+  if (lines.length === 0) lines.push('');
+  if (truncated) {
+    const last = lines[lines.length - 1];
+    let clipped = last;
+    while (clipped.length > 1 && ctx.measureText(`${clipped}…`).width > maxWidth) {
+      clipped = clipped.slice(0, -1);
+    }
+    lines[lines.length - 1] = `${clipped}…`;
+  }
+  return lines;
+}
+
+function drawChatBubble(
+  ctx: CanvasRenderingContext2D,
+  actor: { w: number },
+  anim: { x: number; y: number },
+  message: AgentMessage,
+  tick: number
+): void {
+  const age = Math.max(0, tick - message.tick);
+  const alpha = age > 200 ? Math.max(0.1, (240 - age) / 40) : 1;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.font = '500 9px "Plus Jakarta Sans", sans-serif';
+  const lines = wrapBubbleText(ctx, message.text.trim(), 150, 2);
+  const lineHeight = 10.5;
+  let widest = 0;
+  for (const line of lines) widest = Math.max(widest, ctx.measureText(line).width);
+  const boxW = Math.max(40, Math.min(172, widest + 15));
+  const boxH = 7 + lines.length * lineHeight;
+  const centerX = Math.max(
+    boxW / 2 + 14,
+    Math.min(WORLD_WIDTH - boxW / 2 - 14, anim.x + actor.w / 2)
+  );
+  const boxY = Math.max(8, anim.y - 49 - (lines.length - 1) * lineHeight);
+  const accent =
+    message.kind === 'request'
+      ? 'rgba(245, 158, 11, 0.7)'
+      : message.kind === 'alert'
+        ? 'rgba(244, 63, 94, 0.7)'
+        : message.kind === 'claim'
+          ? 'rgba(56, 189, 248, 0.65)'
+          : 'rgba(148, 163, 184, 0.45)';
+
+  ctx.fillStyle = 'rgba(2, 6, 12, 0.45)';
+  ctx.beginPath();
+  ctx.roundRect(centerX - boxW / 2 + 1.5, boxY + 2, boxW, boxH, 5);
+  ctx.fill();
+
+  ctx.fillStyle = 'rgba(9, 14, 23, 0.94)';
+  ctx.beginPath();
+  ctx.roundRect(centerX - boxW / 2, boxY, boxW, boxH, 5);
+  ctx.fill();
+  ctx.strokeStyle = accent;
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Small speech tail toward the actor.
+  ctx.fillStyle = 'rgba(9, 14, 23, 0.94)';
+  ctx.beginPath();
+  ctx.moveTo(centerX - 4, boxY + boxH - 0.5);
+  ctx.lineTo(centerX + 4, boxY + boxH - 0.5);
+  ctx.lineTo(centerX, boxY + boxH + 4.5);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.fillStyle = '#E8F0FA';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  for (let i = 0; i < lines.length; i += 1) {
+    ctx.fillText(lines[i], centerX, boxY + 3.8 + i * lineHeight + lineHeight / 2);
+  }
+  ctx.restore();
+}
 
 export function GameCanvas({
   worldRef,
@@ -2109,12 +2232,16 @@ export function GameCanvas({
             Math.hypot(targetCrateX - cRender.x, targetCrateY - cRender.y) > 90
           ) {
             cRender = { x: targetCrateX, y: targetCrateY };
-          } else if (holder && holderAnim) {
-            cRender = { x: targetCrateX, y: targetCrateY };
           } else {
+            // A carried crate keeps its own position and catches up to the hands.
+            // During the pickup lift it follows more slowly so it visibly rises from the floor.
+            const pickupLift = Boolean(holderAnim && holderAnim.pickupTimer > 0);
+            const follow = prefersReducedMotion
+              ? 1
+              : 1 - Math.exp(-(holder ? (pickupLift ? 12 : 40) : 38) * dt);
             cRender = {
-              x: cRender.x + (targetCrateX - cRender.x) * smoothAlpha,
-              y: cRender.y + (targetCrateY - cRender.y) * smoothAlpha,
+              x: cRender.x + (targetCrateX - cRender.x) * follow,
+              y: cRender.y + (targetCrateY - cRender.y) * follow,
             };
           }
           crateRenderPosRef.current.set(crate.id, cRender);
@@ -2155,8 +2282,10 @@ export function GameCanvas({
           cratePrevRef.current.set(crate.id, { vy: crate.vy, grounded: crate.grounded });
 
           if (humanActor && !humanActor.holdingCrateId && humanActor.respawnTimer <= 0 && !isHeld) {
-            const d = Math.hypot(humanCx - (crate.x + crate.w * 0.5), humanCy - (crate.y + crate.h * 0.5));
-            if (d < nearestGrabDist) {
+            const crateCx = crate.x + crate.w * 0.5;
+            const crateCy = crate.y + crate.h * 0.5;
+            const d = Math.hypot(humanCx - crateCx, humanCy - crateCy);
+            if (Math.abs(crateCy - humanCy) <= 46 && d < nearestGrabDist) {
               nearestGrabDist = d;
               nearestGrabCrate = crate;
             }
@@ -2368,7 +2497,7 @@ export function GameCanvas({
             anim = createActorAnimState(actor);
             animMap.set(actor.id, anim);
           } else {
-            const feedback = updateActorAnimState(anim, actor, currentWorld.crates, dt, spawnParticles);
+            const feedback = updateActorAnimState(anim, actor, currentWorld.crates, dt, spawnParticles, currentWorld.actors, now);
             if (feedback.bounced) {
               soundFX.playBounce();
               triggerShake(2.2);
@@ -2382,46 +2511,15 @@ export function GameCanvas({
 
           drawActorCharacter(ctx, actor, anim, currentWorld.crates, now, showPlansRef.current);
 
-          if (showPlansRef.current && actor.role === 'agent') {
-            const recentMsg = [...(currentWorld.messages ?? [])]
-              .reverse()
-              .find((m) => m.actorId === actor.id && currentWorld.tick - m.tick <= 180);
-            if (recentMsg) {
-              const rawText = recentMsg.text.trim();
-              const msgText = rawText.length > 32 ? `${rawText.slice(0, 31)}…` : rawText;
-              const ageAlpha =
-                currentWorld.tick - recentMsg.tick > 150
-                  ? Math.max(0.15, (180 - (currentWorld.tick - recentMsg.tick)) / 30)
-                  : 1;
-              ctx.save();
-              ctx.globalAlpha = ageAlpha;
-              ctx.font = '500 8.5px "Plus Jakarta Sans", sans-serif';
-              const textW = ctx.measureText(msgText).width;
-              const boxW = Math.min(176, textW + 12);
-              const boxH = 14;
-              const centerX = Math.max(boxW * 0.5 + 28, Math.min(WORLD_WIDTH - boxW * 0.5 - 28, anim.x + actor.w * 0.5));
-              const boxY = Math.max(26, anim.y - 54);
-              const accent =
-                recentMsg.kind === 'request'
-                  ? 'rgba(245, 158, 11, 0.65)'
-                  : recentMsg.kind === 'alert'
-                    ? 'rgba(244, 63, 94, 0.65)'
-                    : recentMsg.kind === 'claim'
-                      ? 'rgba(56, 189, 248, 0.55)'
-                      : 'rgba(148, 163, 184, 0.35)';
-              ctx.fillStyle = 'rgba(11, 16, 24, 0.88)';
-              ctx.beginPath();
-              ctx.roundRect(centerX - boxW * 0.5, boxY, boxW, boxH, 4);
-              ctx.fill();
-              ctx.strokeStyle = accent;
-              ctx.lineWidth = 1;
-              ctx.stroke();
-              ctx.fillStyle = '#F1F5F9';
-              ctx.textAlign = 'center';
-              ctx.textBaseline = 'middle';
-              ctx.fillText(msgText, centerX, boxY + boxH * 0.5 + 0.5, boxW - 10);
-              ctx.restore();
-            }
+          const latestMessage = (currentWorld.messages ?? []).reduce<AgentMessage | null>(
+            (best, message) =>
+              message.actorId === actor.id && (!best || message.tick > best.tick)
+                ? message
+                : best,
+            null
+          );
+          if (latestMessage && currentWorld.tick - latestMessage.tick <= 240) {
+            drawChatBubble(ctx, actor, anim, latestMessage, currentWorld.tick);
           }
         }
 

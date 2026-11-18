@@ -471,9 +471,136 @@ export const LEVELS: LevelDefinition[] = [
     },
   },
   {
-    id: 'sandbox',
+    id: 'level-5',
     index: 4,
-    name: '05. Physics Sandbox',
+    name: '05. Cascade Foundry',
+    subtitle: 'Keep the plate weighted while a partner rides the lift and threads two gated switches.',
+    hint: 'Push Crate 1 onto Plate A to raise Gate A and drive the lift. Ride the lift to the upper deck, toggle Switch B, then Switch C; the exit needs A, B and C held together.',
+    width: WORLD_WIDTH,
+    height: WORLD_HEIGHT,
+    spawns: [
+      { x: 56, y: 430 },
+      { x: 102, y: 430 },
+      { x: 148, y: 430 },
+      { x: 194, y: 430 },
+    ],
+    platforms: [
+      { id: 'floor-main', x: 0, y: 492, w: 960, h: 48, kind: 'solid' },
+      { id: 'wall-left', x: 0, y: 0, w: 24, h: 540, kind: 'solid' },
+      { id: 'wall-right', x: 936, y: 0, w: 24, h: 540, kind: 'solid' },
+      { id: 'ceil-top', x: 0, y: 0, w: 960, h: 24, kind: 'solid' },
+
+      // No upper bypass: the launch pad is the only route once Gate A opens.
+      // Upper maintenance deck reached by the Channel A lift or the launch pad
+      { id: 'l5-upper-deck', x: 620, y: 320, w: 140, h: 20, kind: 'solid' },
+      {
+        id: 'l5-lift',
+        x: 520,
+        y: 454,
+        w: 96,
+        h: 18,
+        kind: 'moving',
+        startPos: { x: 520, y: 454 },
+        endPos: { x: 520, y: 320 },
+        speed: 0.5,
+        channel: 'A',
+        loopWhenActive: true,
+      },
+
+      // Right exit deck behind Gate B
+      { id: 'l5-exit-deck', x: 760, y: 380, w: 176, h: 24, kind: 'solid' },
+
+      // High-restitution launch pad under the upper deck
+      { id: 'l5-launch', x: 640, y: 478, w: 92, h: 14, kind: 'solid', material: 'bouncy', bounceVelocity: 820 },
+
+      // Low ice lip before the plate; makes the crate push feel slippery
+      { id: 'l5-ice', x: 300, y: 484, w: 92, h: 8, kind: 'solid', material: 'ice' },
+    ],
+    plates: [
+      {
+        id: 'plate-a',
+        label: 'Plate A',
+        x: 236,
+        y: 480,
+        w: 70,
+        h: 12,
+        channel: 'A',
+        mode: 'momentary',
+      },
+    ],
+    switches: [
+      {
+        id: 'switch-b',
+        label: 'Switch B',
+        x: 650,
+        y: 284,
+        w: 28,
+        h: 36,
+        channel: 'B',
+        initialActive: false,
+      },
+      {
+        id: 'switch-c',
+        label: 'Switch C',
+        x: 872,
+        y: 344,
+        w: 28,
+        h: 36,
+        channel: 'C',
+        initialActive: false,
+      },
+    ],
+    doors: [
+      {
+        id: 'door-a',
+        label: 'Gate A',
+        x: 480,
+        y: 332,
+        w: 22,
+        h: 160,
+        channels: ['A'],
+        logic: 'ALL',
+      },
+      {
+        id: 'door-b',
+        label: 'Gate B',
+        x: 760,
+        y: 320,
+        w: 22,
+        h: 172,
+        channels: ['B'],
+        logic: 'ALL',
+      },
+    ],
+    crates: [
+      {
+        id: 'crate-1',
+        label: 'Crate 1',
+        x: 150,
+        y: 462,
+        w: 30,
+        h: 30,
+        shape: 'box',
+        material: 'wood',
+        mass: 1.2,
+      },
+    ],
+    hazards: [
+      { id: 'hazard-l5', x: 530, y: 482, w: 74, h: 10, kind: 'plasma' },
+    ],
+    exit: {
+      id: 'exit-5',
+      x: 824,
+      y: 316,
+      w: 76,
+      h: 64,
+      requiredChannels: ['A', 'B', 'C'],
+    },
+  },
+  {
+    id: 'sandbox',
+    index: 5,
+    name: '06. Physics Sandbox',
     subtitle: 'Experiment with gravity, elastic collisions, ice, bounce pads, and wind tunnels.',
     hint: 'Use the Sandbox tab to spawn crates, kinetic spheres, ice strips, bounce pads, or updrafts, fling bodies with your cursor, or tune gravity & restitution in real time.',
     isSandbox: true,

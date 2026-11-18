@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,6 +20,7 @@ import {
   updateWorldPhysics,
 } from './src/engine/physics';
 import { createAgentMemory, decideAgentAction, type AgentPlannerMemory } from './src/engine/agentPlanner';
+import { LlmAgentManager, LlmSpawnError } from './src/server/llm/manager';
 import type {
   ActorInput,
   ActorRole,
@@ -35,6 +37,7 @@ import type {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT ?? 3000);
+const HOST = (process.env.HOST ?? '127.0.0.1').trim() || '127.0.0.1';
 
 interface ConnectedClient {
   id: string;
@@ -53,6 +56,12 @@ interface LocalAgentBot {
 }
 
 const AGENT_NAMES = ['Relay-Alpha', 'Relay-Beta', 'Relay-Gamma', 'Relay-Delta'];
+
+function adminAuthorized(req: express.Request): boolean {
+  const token = (process.env.RELAYLAB_ADMIN_TOKEN ?? '').trim();
+  if (!token) return true;
+  return req.get('x-relaylab-admin-token') === token;
+}
 
 class CentralizedEngineServer {
   currentLevel: LevelDefinition = getLevelById('level-1');
@@ -363,6 +372,27 @@ async function startServer() {
 
   const server = http.createServer(app);
   const engine = new CentralizedEngineServer();
+  const llm = new LlmAgentManager({
+    getWorld: () => engine.world,
+    addActor: ({ id, name }) =>
+      addActorToWorld(engine.world, engine.currentLevel, {
+        id,
+        name,
+        role: 'agent',
+        connected: true,
+      }),
+    removeActor: (actorId) => engine.removeAgent(actorId),
+    buildObservation: (actorId) => buildAgentObservation(engine.world, actorId),
+    setInput: (actorId, input) => {
+      engine.inputs[actorId] = input;
+    },
+    recordMessage: (actorId, text, opts) => {
+      const recorded = recordAgentMessage(engine.world, actorId, text, opts);
+      if (recorded) engine.broadcastState();
+      return Boolean(recorded);
+    },
+    broadcast: () => engine.broadcastState(),
+  });
   const wss = new WebSocketServer({ server, path: '/ws' });
 
   wss.on('connection', (ws) => {
@@ -504,6 +534,7 @@ async function startServer() {
       tickRateHz: 60,
       connections: engine.clients.size,
       actors: engine.world.actors.length,
+      llmAgents: llm.count(),
     });
   });
 
@@ -547,6 +578,40 @@ async function startServer() {
       })),
       wsConnections: engine.clients.size,
     });
+  });
+
+  app.get('/api/llm/providers', (_req, res) => {
+    res.json({ providers: llm.providers() });
+  });
+
+  app.post('/api/agents/llm', (req, res) => {
+    if (!adminAuthorized(req)) {
+      res.status(403).json({ error: 'Admin token required' });
+      return;
+    }
+    try {
+      const body = req.body ?? {};
+      const result = llm.spawn({
+        name: typeof body.name === 'string' ? body.name : '',
+        provider: typeof body.provider === 'string' ? body.provider : 'mock',
+        model: typeof body.model === 'string' ? body.model : undefined,
+        persona: typeof body.persona === 'string' ? body.persona : undefined,
+        controlMode: body.controlMode === 'direct' ? 'direct' : 'hybrid',
+      });
+      res.status(201).json({
+        actorId: result.actor.id,
+        actor: result.actor,
+        status: result.status,
+        contextUrl: `/api/agents/${encodeURIComponent(result.actor.id)}/context`,
+        statusUrl: `/api/agents/${encodeURIComponent(result.actor.id)}/llm`,
+      });
+    } catch (error) {
+      if (error instanceof LlmSpawnError) {
+        res.status(error.statusCode).json({ error: error.message });
+        return;
+      }
+      res.status(500).json({ error: 'Failed to spawn LLM agent' });
+    }
   });
 
   app.post('/api/agents/register', (req, res) => {
@@ -667,7 +732,50 @@ async function startServer() {
     });
   });
 
+  app.get('/api/agents/:id/context', (req, res) => {
+    const context = llm.contextFor(req.params.id);
+    if (!context) {
+      res.status(404).json({ error: `Actor '${req.params.id}' not found` });
+      return;
+    }
+    res.json({
+      ...context,
+      observationUrl: `/api/state?actorId=${encodeURIComponent(req.params.id)}`,
+      inputUrl: `/api/agents/${encodeURIComponent(req.params.id)}/input`,
+      messageUrl: `/api/agents/${encodeURIComponent(req.params.id)}/message`,
+    });
+  });
+
+  app.get('/api/agents/:id/llm', (req, res) => {
+    const status = llm.getStatus(req.params.id);
+    if (!status) {
+      res.status(404).json({ error: `No LLM runner for actor '${req.params.id}'` });
+      return;
+    }
+    res.json({ status });
+  });
+
+  app.delete('/api/agents/llm/:id', (req, res) => {
+    if (!adminAuthorized(req)) {
+      res.status(403).json({ error: 'Admin token required' });
+      return;
+    }
+    if (!llm.stop(req.params.id)) {
+      res.status(404).json({ error: `No LLM runner for actor '${req.params.id}'` });
+      return;
+    }
+    res.json({ removed: true, actorId: req.params.id });
+  });
+
   app.delete('/api/agents/:id', (req, res) => {
+    if (!adminAuthorized(req)) {
+      res.status(403).json({ error: 'Admin token required' });
+      return;
+    }
+    if (llm.stop(req.params.id)) {
+      res.json({ removed: true, actorId: req.params.id });
+      return;
+    }
     const removed = engine.removeAgent(req.params.id);
     if (!removed) {
       res.status(404).json({ error: `Actor '${req.params.id}' not found` });
@@ -854,8 +962,8 @@ async function startServer() {
   };
   setTimeout(runTickLoop, tickIntervalMs);
 
-  server.listen(PORT, '0.0.0.0', () => {
-    console.log(`RelayLab centralized server listening on http://0.0.0.0:${PORT}`);
+  server.listen(PORT, HOST, () => {
+    console.log(`RelayLab centralized server listening on http://${HOST}:${PORT}`);
     // Spawn two real WebSocket collaborative agents by default so the arena is alive on first arrival
     setTimeout(() => {
       engine.spawnLocalAgent('Relay-Alpha');

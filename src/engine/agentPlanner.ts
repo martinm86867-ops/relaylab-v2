@@ -17,6 +17,10 @@ export interface AgentPlannerMemory {
   lastDecisionIntent: string;
   lastAnnouncedKey: string;
   lockedAirTarget: { x: number; y: number; ticks: number } | null;
+  jumpFreezeTicks: number;
+  hazardBackoffTicks: number;
+  hazardBackoffDir: -1 | 0 | 1;
+  airHazardDir: -1 | 0 | 1;
 }
 
 export function createAgentMemory(): AgentPlannerMemory {
@@ -30,6 +34,10 @@ export function createAgentMemory(): AgentPlannerMemory {
     lastDecisionIntent: '',
     lastAnnouncedKey: '',
     lockedAirTarget: null,
+    jumpFreezeTicks: 0,
+    hazardBackoffTicks: 0,
+    hazardBackoffDir: 0,
+    airHazardDir: 0,
   };
 }
 
@@ -102,6 +110,99 @@ const MAX_GRAPH_CACHE = 10;
 
 const graphCache = new Map<string, NavigationGraph>();
 
+function rectsOverlap(
+  ax: number,
+  ay: number,
+  aw: number,
+  ah: number,
+  bx: number,
+  by: number,
+  bw: number,
+  bh: number
+): boolean {
+  return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+}
+
+function hazardAt(obs: AgentObservation, x: number, y: number): boolean {
+  return obs.hazards.some((hazard) =>
+    rectsOverlap(x + 2, y + 2, ACTOR_W - 4, ACTOR_H - 4, hazard.x, hazard.y, hazard.w, hazard.h)
+  );
+}
+
+function hazardAhead(obs: AgentObservation, move: -1 | 0 | 1): AgentObservation['hazards'][number] | null {
+  if (move === 0) return null;
+  const self = obs.self;
+  const selfCx = self.x + ACTOR_W / 2;
+  const selfBottom = self.y + ACTOR_H;
+  for (const hazard of obs.hazards) {
+    // Only hazards at (roughly) the bot's footing are a walking threat; a
+    // hazard far overhead or above a platform is not in the path.
+    if (hazard.y > selfBottom + 8 || hazard.y + hazard.h < selfBottom - 46) continue;
+    if (move === 1) {
+      if (hazard.x >= selfCx - 2 && hazard.x - selfCx <= 46) return hazard;
+    } else if (hazard.x + hazard.w <= selfCx + 2 && selfCx - (hazard.x + hazard.w) <= 46) {
+      return hazard;
+    }
+  }
+  return null;
+}
+
+/**
+ * Trace a jump arc and report whether it passes through or lands in a hazard.
+ * Bots were killing themselves by triggering obstacle jumps while standing at
+ * a plasma strip; a jump is only allowed when this trace is clear.
+ */
+function jumpHitsHazard(
+  obs: AgentObservation,
+  move: -1 | 0 | 1,
+  initialVy = -JUMP_SPEED
+): boolean {
+  const gravity = obs.physics.gravity || 1450;
+  let x = obs.self.x;
+  let y = obs.self.y;
+  let vx = move * RUN_SPEED;
+  let vy = initialVy;
+  for (let tick = 0; tick < 90; tick++) {
+    vy = Math.min(MAX_FALL_SPEED, vy + gravity * SIM_DT);
+    x += vx * SIM_DT;
+    y += vy * SIM_DT;
+    // Ignore the first instants of takeoff: an actor standing flush against a
+    // hazard has to clear it before the arc is judged.
+    if (tick >= 3 && hazardAt(obs, x, y)) return true;
+    if (tick > 8 && vy > 0 && y + ACTOR_H >= 480) {
+      const floorY = 492 - ACTOR_H;
+      return hazardAt(obs, x, Math.min(y, floorY));
+    }
+  }
+  return false;
+}
+
+/** Follow a free-fall arc and return the first hazard it would enter. */
+function fallIntoHazard(
+  obs: AgentObservation,
+  startX: number,
+  startY: number,
+  startVx: number,
+  startVy: number
+): AgentObservation['hazards'][number] | null {
+  const gravity = obs.physics.gravity || 1450;
+  let x = startX;
+  let y = startY;
+  let vx = startVx;
+  let vy = startVy;
+  for (let tick = 0; tick < 120; tick++) {
+    vy = Math.min(MAX_FALL_SPEED, vy + gravity * SIM_DT);
+    x += vx * SIM_DT;
+    y += vy * SIM_DT;
+    const hazard = obs.hazards.find((hz) =>
+      rectsOverlap(x + 2, y + 2, ACTOR_W - 4, ACTOR_H - 4, hz.x, hz.y, hz.w, hz.h)
+    );
+    if (hazard) return hazard;
+    if (y + ACTOR_H >= 492) return null;
+  }
+  return null;
+}
+
 function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
 }
@@ -141,8 +242,20 @@ export function buildWalkSegments(obs: AgentObservation): WalkSegment[] {
   const rawSegments: WalkSegment[] = [];
   const standingWalls = obs.platforms.filter((p) => p.y > 30 && p.w < 36);
 
+  const walkablePlatforms = obs.platforms.filter((p) => p.y > 30 && p.w >= 36);
+
   for (const p of obs.platforms) {
     if (p.y <= 30 || p.w < 36) continue;
+    // A flush strip laid directly on a wider deck is not a separate ledge: the
+    // actor walks over it. Treating it as its own segment creates micro-hops
+    // (floor -> strip -> floor) and makes the follower flip at the strip edge.
+    const redundantSurface = walkablePlatforms.some((other) => {
+      if (other.id === p.id || other.w < p.w || other.y < p.y) return false;
+      if (Math.abs(other.y - p.y) > 10) return false;
+      const overlap = Math.min(p.x + p.w, other.x + other.w) - Math.max(p.x, other.x);
+      return overlap >= Math.min(p.w, other.w) * 0.6;
+    });
+    if (redundantSurface) continue;
     rawSegments.push({
       id: p.id,
       sourceId: p.id,
@@ -547,7 +660,7 @@ function computeDirectTransition(
   const maxBroadUpGap = Math.min(280, 150 * Math.sqrt(Math.max(0.8, gravityRatio)));
 
   // Case 1: Jumping UP (b is higher than a)
-  if (dy < -6) {
+  if (dy < -12) {
     const candidates: Array<{ tx: number; lx: number; gap: number }> = [];
     const overlapsHoriz = a.x1 < b.x2 && a.x2 > b.x1;
 
@@ -605,11 +718,40 @@ function computeDirectTransition(
         best = { tx: validTx, lx: cand.lx, mode: 'jump', cost };
       }
     }
+
+    // Candidate 3: updraft-assisted ascent. A bot cannot jump 200+ px, but the
+    // updraft can carry it. Try takeoffs inside the updraft column and let the
+    // ballistic simulator account for the force zone.
+    for (const fz of obs.forceZones ?? []) {
+      if (fz.fy >= -350) continue;
+      if (!(fz.y <= a.y && fz.y + fz.h >= b.y)) continue;
+      const zoneTxLo = Math.max(a.x1 + 8, fz.x + 8);
+      const zoneTxHi = Math.min(a.x2 - 8, fz.x + fz.w - 8);
+      if (zoneTxLo > zoneTxHi) continue;
+      const zoneCenter = clamp(fz.x + fz.w * 0.5, zoneTxLo, zoneTxHi);
+      const txCandidates = [zoneCenter, clamp(zoneCenter - 14, zoneTxLo, zoneTxHi), clamp(zoneCenter + 14, zoneTxLo, zoneTxHi)];
+      const lxCandidates = [
+        clamp(b.x1 + 22, b.x1 + 12, b.x2 - 12),
+        clamp((b.x1 + b.x2) * 0.5, b.x1 + 12, b.x2 - 12),
+        clamp(b.x2 - 22, b.x1 + 12, b.x2 - 12),
+      ];
+      for (const testTx of txCandidates) {
+        for (const testLx of lxCandidates) {
+          if (isBlockedByClosedDoor(testTx, testLx, a.y, b.y, obs)) continue;
+          if (isBlockedByVerticalWall(testTx, testLx, a.y, b.y, obs)) continue;
+          if (!simulateTrajectory(testTx, a, b, testLx, 'jump', obs, requireComfortMargin)) continue;
+          const cost = Math.hypot(testLx - testTx, dy) + 42;
+          if (!best || cost < best.cost) {
+            best = { tx: testTx, lx: testLx, mode: 'jump', cost };
+          }
+        }
+      }
+    }
     return best;
   }
 
-  // Case 2: Same level or slight step (|dy| <= 6)
-  if (Math.abs(dy) <= 6) {
+  // Case 2: Same level or slight step (|dy| <= 12)
+  if (Math.abs(dy) <= 12) {
     let tx: number;
     let lx: number;
     let gap: number;
@@ -669,7 +811,7 @@ function computeDirectTransition(
     };
   }
 
-  // Case 3: Dropping DOWN (b.y > a.y + 6)
+  // Case 3: Dropping DOWN (b.y > a.y + 12)
   const dropDist = dy;
   const maxDropGap = Math.min(220, 115 + dropDist * 0.45);
   const dropCandidates: Array<{ tx: number; lx: number; cost: number; mode: WaypointMode }> = [];
@@ -750,9 +892,38 @@ function computeDirectTransition(
     }
   }
 
-  if (dropCandidates.length === 0) return null;
-  dropCandidates.sort((c1, c2) => c1.cost - c2.cost);
-  return dropCandidates[0];
+  // A downward move can also be a jump across a gap. Walk-off drops use only
+  // the small initial speed, so a platform 100+ px away is correctly rejected;
+  // a real player jumps. Try both lips and the target's centre/edges.
+  const jumpDownCandidates: typeof dropCandidates = [];
+  const downTxCandidates = [
+    clamp(a.x1 + 10, a.x1 + 4, a.x2 - 4),
+    clamp(a.x2 - 10, a.x1 + 4, a.x2 - 4),
+    clamp((a.x1 + a.x2) * 0.5, a.x1 + 4, a.x2 - 4),
+  ];
+  const downLxCandidates = [
+    clamp(b.x1 + 20, b.x1 + 14, b.x2 - 14),
+    clamp((b.x1 + b.x2) * 0.5, b.x1 + 14, b.x2 - 14),
+    clamp(b.x2 - 20, b.x1 + 14, b.x2 - 14),
+  ];
+  for (const tx of downTxCandidates) {
+    for (const lx of downLxCandidates) {
+      if (isBlockedByClosedDoor(tx, lx, a.y, b.y, obs)) continue;
+      if (isBlockedByVerticalWall(tx, lx, a.y, b.y, obs)) continue;
+      if (!simulateTrajectory(tx, a, b, lx, 'jump', obs, false)) continue;
+      jumpDownCandidates.push({
+        tx,
+        lx,
+        mode: 'jump',
+        cost: Math.hypot(lx - tx, dropDist) + 46,
+      });
+    }
+  }
+
+  const allDropCandidates = dropCandidates.concat(jumpDownCandidates);
+  if (allDropCandidates.length === 0) return null;
+  allDropCandidates.sort((c1, c2) => c1.cost - c2.cost);
+  return allDropCandidates[0];
 }
 
 function isSegmentPowered(seg: WalkSegment, obs: AgentObservation): boolean {
@@ -924,7 +1095,35 @@ export function resolvePathFromTree(
   }
 
   if (!tree.prevEdge.has(goalSeg.id)) {
-    return { reachable: false, cost: Infinity, nextTarget: goalWp, waypoints: [startWp, goalWp] };
+    // Unreachable goals used to fall back to a straight start->goal line, which
+    // sent bots walking into locked gates, walls, and plasma. Retreat to the
+    // reachable frontier closest to the goal instead: a safe partial route is
+    // always better than a straight line through danger.
+    let frontier: WalkSegment | null = null;
+    let frontierDist = Infinity;
+    for (const seg of tree.graph.segments) {
+      if (!tree.prevEdge.has(seg.id)) continue;
+      const px = clamp(goalPt.x, seg.x1 + 14, seg.x2 - 14);
+      const dist = Math.hypot(px - goalPt.x, seg.y - goalPt.y);
+      if (dist < frontierDist) {
+        frontierDist = dist;
+        frontier = seg;
+      }
+    }
+    if (frontier) {
+      const pt = {
+        x: clamp(goalPt.x, frontier.x1 + 14, frontier.x2 - 14),
+        y: frontier.y,
+      };
+      const partial = resolvePathFromTree(obs, tree, pt);
+      return {
+        reachable: false,
+        cost: Infinity,
+        nextTarget: partial.nextTarget,
+        waypoints: partial.waypoints,
+      };
+    }
+    return { reachable: false, cost: Infinity, nextTarget: startWp, waypoints: [startWp] };
   }
 
   const hops: Array<{ from: WalkSegment; to: WalkSegment; edge: EdgeTransition }> = [];
@@ -1682,8 +1881,49 @@ export function decideAgentAction(
     }
   }
 
+  // A bot can end up standing on a crate (actors stack). The navigation graph
+  // only knows platform tops, so its waypoints assume floor height and the
+  // follower flips at the crate lip. Walk off the crate toward the current
+  // objective instead of trying to follow a floor-level waypoint while elevated.
+  const crateUnderfoot = obs.crates.find(
+    (crate) =>
+      selfCx >= crate.x - 1 &&
+      selfCx <= crate.x + crate.w + 1 &&
+      Math.abs(selfBottom - crate.y) <= 3
+  );
+  let forceJumpFromCrate = false;
+  if (crateUnderfoot && !isWaitingOnMoving && !holdingStationaryPlate) {
+    // Pick the escape side from the next route waypoint, not the final goal:
+    // the route may legitimately go away from the goal before looping back.
+    const escapeX =
+      wp1 && Math.abs(wp1.x - selfCx) > 8
+        ? wp1.x
+        : wp2?.x ?? chosenTargetPos.x;
+    const stepDir = escapeX >= selfCx ? 1 : -1;
+    aimPt = { x: clamp(selfCx + stepDir * 52, 20, 940), y: selfBottom, mode: 'walk' };
+    forceJumpFromCrate = true;
+  }
+
+  // A bounce-pad launch throws the bot upward away from its planned takeoff.
+  // If an updraft is within reach while airborne, steer into it instead of
+  // fighting the launch back toward the floor-level waypoint.
+  const updraftInReach = obs.forceZones.find(
+    (fz) =>
+      fz.fy < -350 &&
+      selfBottom >= fz.y + 70 &&
+      selfBottom <= fz.y + fz.h + 12 &&
+      Math.abs(selfCx - (fz.x + fz.w * 0.5)) <= 180
+  );
+  if (!obs.self.grounded && updraftInReach && !forceJumpFromCrate && chosenIntent !== 'Move to Exit Pad') {
+    aimPt = { x: updraftInReach.x + updraftInReach.w * 0.5, y: selfBottom, mode: 'walk' };
+  }
+
   const dx = aimPt.x - selfCx;
   const dy = aimPt.y - selfBottom;
+
+  if (memory.jumpFreezeTicks > 0) {
+    memory.jumpFreezeTicks -= 1;
+  }
 
   let move: -1 | 0 | 1 = 0;
   if (holdingStationaryPlate) {
@@ -1696,6 +1936,23 @@ export function decideAgentAction(
   } else {
     if (dx > 5) move = 1;
     else if (dx < -5) move = -1;
+  }
+
+  if (obs.self.grounded) memory.airHazardDir = 0;
+
+  if (memory.hazardBackoffTicks > 0) {
+    memory.hazardBackoffTicks -= 1;
+    if (memory.hazardBackoffDir !== 0) move = memory.hazardBackoffDir;
+  } else if (!obs.self.grounded && obs.self.vy > 30) {
+    // Falling toward a strip: override route steering and lean away. Hold the
+    // chosen direction until landing; recomputing it every tick made the input
+    // alternate left/right and drift back onto the hazard edge.
+    const hazard = fallIntoHazard(obs, obs.self.x, obs.self.y, obs.self.vx, obs.self.vy);
+    if (hazard) {
+      const hazardCx = hazard.x + hazard.w / 2;
+      memory.airHazardDir = hazardCx >= selfCx ? -1 : 1;
+    }
+    if (memory.airHazardDir !== 0) move = memory.airHazardDir;
   }
 
   const movedDist = Math.hypot(obs.self.x - memory.lastX, obs.self.y - memory.lastY);
@@ -1717,18 +1974,75 @@ export function decideAgentAction(
     memory.jumpReleaseCooldown -= 1;
   }
 
+  const blockingCrateAhead = obs.crates.find((crate) => {
+    if (crate.id === chosenTargetId) return false;
+    if (Math.abs(crate.y + crate.h - selfBottom) > 44) return false;
+    const inFront =
+      (move === 1 && crate.x >= selfCx && crate.x - selfCx <= 36) ||
+      (move === -1 && crate.x + crate.w <= selfCx && selfCx - (crate.x + crate.w) <= 36);
+    if (!inFront) return false;
+    const stackedAbove = obs.crates.some(
+      (other) =>
+        other.id !== crate.id &&
+        other.x < crate.x + crate.w &&
+        other.x + other.w > crate.x &&
+        Math.abs(other.y + other.h - crate.y) <= 4
+    );
+    return crate.shape === 'ball' || stackedAbove;
+  });
+
   let jump = false;
   if (obs.self.grounded && memory.jumpReleaseCooldown === 0 && !isWaitingOnMoving && !holdingStationaryPlate) {
+    // Bounce pads are solid surfaces with huge restitution. Walking onto one
+    // launches the bot away from its route and into a fall loop, so hop over
+    // the pad before contact.
+    const bouncePadAhead = obs.platforms.some(
+      (plat) =>
+        plat.material === 'bouncy' &&
+        Math.abs(selfBottom - plat.y) <= 18 &&
+        ((move === 1 && plat.x > selfCx && plat.x - selfCx <= 34) ||
+          (move === -1 && plat.x + plat.w < selfCx && selfCx - (plat.x + plat.w) <= 34))
+    );
     const needsStepUp =
       shouldJumpFromPlan && (dy < -10 || Math.abs(dx) > 10);
     const sameSegmentJump =
       pathResult.waypoints.length === 2 && dy < -18 && Math.abs(dx) < 120;
     const isStuck = memory.stuckTicks > 22;
 
-    if (needsStepUp || sameSegmentJump || isStuck) {
-      jump = true;
-      memory.jumpReleaseCooldown = 2;
-      memory.stuckTicks = 0;
+    const hazardInFront = hazardAhead(obs, move);
+    const wantsJump =
+      forceJumpFromCrate || bouncePadAhead || blockingCrateAhead || needsStepUp || sameSegmentJump || isStuck;
+    if (wantsJump) {
+      if (jumpHitsHazard(obs, move)) {
+        // Neither jump nor keep walking into plasma. Back away from the strip
+        // for a few ticks, then let the path planner find another route.
+        const hazardBlocking =
+          hazardInFront ??
+          obs.hazards.find(
+            (hz) =>
+              hz.y + hz.h >= selfBottom - 4 &&
+              hz.y <= selfBottom + 220 &&
+              hz.x < selfCx + ACTOR_W + 28 &&
+              hz.x + hz.w > selfCx - 28
+          ) ??
+          null;
+        if (hazardBlocking) {
+          const hazardCx = hazardBlocking.x + hazardBlocking.w / 2;
+          memory.hazardBackoffTicks = 18;
+          memory.hazardBackoffDir = hazardCx > selfCx ? -1 : 1;
+          move = memory.hazardBackoffDir;
+        }
+      } else {
+        jump = true;
+        memory.jumpReleaseCooldown = 2;
+        memory.stuckTicks = 0;
+        // Jump straight up first when blocked by a body; steering into it during
+        // the first few airborne ticks just re-collides and cancels the climb.
+        if (isStuck || blockingCrateAhead) memory.jumpFreezeTicks = 14;
+      }
+    }
+    if (memory.jumpFreezeTicks > 0 && !obs.self.grounded) {
+      move = 0;
     }
   } else if (!obs.self.grounded && obs.self.vy < -35) {
     jump = true;

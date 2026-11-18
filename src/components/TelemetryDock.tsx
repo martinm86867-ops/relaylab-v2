@@ -15,6 +15,9 @@ import {
   ArrowUpDown,
   X,
   MessageSquare,
+  Bot,
+  Sparkles,
+  Send,
 } from 'lucide-react';
 import { PHYSICS_PRESETS } from '../engine/levels';
 import { SANDBOX_TOOLS, type SandboxCanvasSelection, type SandboxToolSpec } from '../engine/sandboxTools';
@@ -44,8 +47,10 @@ interface TelemetryDockProps {
   onUpdatePhysics: (partial: Partial<PhysicsConfig>) => void;
   onApplyPhysicsPreset: (presetId: string) => void;
   onSpawnAgent: () => void;
+  onOpenAiAgentModal: () => void;
   onRemoveAgent: (actorId?: string) => void;
   onToggleHuman: (active: boolean) => void;
+  onSendMessage: (text: string) => void;
 }
 
 const CHANNEL_ACCENT: Record<ChannelId, string> = {
@@ -80,8 +85,10 @@ export function TelemetryDock({
   onUpdatePhysics,
   onApplyPhysicsPreset,
   onSpawnAgent,
+  onOpenAiAgentModal,
   onRemoveAgent,
   onToggleHuman,
+  onSendMessage,
 }: TelemetryDockProps) {
   const [internalTab, setInternalTab] = useState<InspectorTab>('agents');
   const activeTab = controlledTab ?? internalTab;
@@ -92,6 +99,7 @@ export function TelemetryDock({
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [apiTestResult, setApiTestResult] = useState<string | null>(null);
   const [apiTestBusy, setApiTestBusy] = useState(false);
+  const [chatText, setChatText] = useState('');
 
   const origin =
     typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000';
@@ -152,6 +160,7 @@ export function TelemetryDock({
   };
 
   const agentCount = world?.actors.filter((a) => a.role === 'agent').length ?? 0;
+  const llmAgentCount = world?.actors.filter((a) => a.controller === 'llm').length ?? 0;
   const hasHuman = Boolean(world?.actors.some((a) => a.role === 'human'));
   const selectedToolSpec =
     SANDBOX_TOOLS.find((t) => t.id === sandboxSelection.tool) ?? SANDBOX_TOOLS[0];
@@ -247,7 +256,16 @@ export function TelemetryDock({
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-amber-500/15 hover:bg-amber-500/25 disabled:opacity-40 text-amber-300 border border-amber-500/30 text-xs font-medium transition-colors cursor-pointer whitespace-nowrap"
               >
                 <Plus className="w-3.5 h-3.5" />
-                Spawn Agent
+                Spawn Bot
+              </button>
+              <button
+                type="button"
+                onClick={onOpenAiAgentModal}
+                disabled={llmAgentCount >= 4}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-sky-500/15 hover:bg-sky-500/25 disabled:opacity-40 text-sky-300 border border-sky-500/30 text-xs font-medium transition-colors cursor-pointer whitespace-nowrap"
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                Spawn AI Agent
               </button>
               <button
                 type="button"
@@ -314,6 +332,24 @@ export function TelemetryDock({
                             <div className="font-mono text-[11px] text-slate-400 truncate">
                               {actor.label} · {actor.role === 'human' ? (isYou ? 'You' : 'Human') : 'Agent'}
                             </div>
+                            {actor.controller === 'llm' && (
+                              <div className="mt-0.5 flex items-center gap-1.5 text-[10px] font-mono truncate">
+                                <span
+                                  className={
+                                    actor.agentStatus === 'error'
+                                      ? 'text-rose-300'
+                                      : actor.agentStatus === 'thinking'
+                                        ? 'text-amber-300'
+                                        : 'text-emerald-300'
+                                  }
+                                >
+                                  {actor.agentStatus ?? 'idle'}
+                                </span>
+                                <span className="text-slate-500 truncate">
+                                  {actor.provider}/{actor.model}
+                                </span>
+                              </div>
+                            )}
                           </div>
                         </div>
                         {actor.role === 'agent' && (
@@ -376,6 +412,11 @@ export function TelemetryDock({
                             {actor.lastInput.reason}
                           </div>
                         )}
+                        {actor.agentError && (
+                          <div className="text-rose-300 leading-snug break-words">
+                            {actor.agentError}
+                          </div>
+                        )}
                       </div>
                     </div>
                   );
@@ -399,6 +440,34 @@ export function TelemetryDock({
                 <code className="text-slate-300 font-mono">/api/agents/:id/message</code> or WS{' '}
                 <code className="text-slate-300 font-mono">message</code>.
               </div>
+              <form
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  const text = chatText.trim();
+                  if (!text || !humanActorId) return;
+                  onSendMessage(text);
+                  setChatText('');
+                }}
+                className="flex items-center gap-1.5 pt-1"
+              >
+                <input
+                  value={chatText}
+                  onChange={(event) => setChatText(event.target.value)}
+                  maxLength={220}
+                  disabled={!humanActorId}
+                  aria-label="Squad message"
+                  placeholder={humanActorId ? 'Message your squad…' : 'Join as human to chat'}
+                  className="min-w-0 flex-1 rounded-md border border-slate-800 bg-[#0B1018] px-2.5 py-1.5 text-xs text-slate-200 placeholder:text-slate-600 outline-none focus:border-sky-500 disabled:opacity-50"
+                />
+                <button
+                  type="submit"
+                  disabled={!humanActorId || !chatText.trim()}
+                  className="inline-flex items-center gap-1 rounded-md border border-sky-500/30 bg-sky-500/15 px-2 py-1.5 text-[11px] font-medium text-sky-300 hover:bg-sky-500/25 disabled:opacity-40"
+                >
+                  <Send className="h-3 w-3" />
+                  Send
+                </button>
+              </form>
               {!world || world.messages.length === 0 ? (
                 <div className="bg-[#0B1018] border border-slate-800/80 rounded-md px-2.5 py-3 text-xs text-slate-500 text-center">
                   No coordination messages posted in this chamber yet.
